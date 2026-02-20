@@ -39,7 +39,7 @@ class GeneratorConfig:
     completion_target: float = 0.85
     max_iterations: int = 2500
     retry_limit: int = 3
-    min_theme_words: int = 2
+    min_theme_coverage: float = 0.10
     max_theme_ratio: float = 0.4
     theme_request_size: int = 80
     theme_placement_attempts: int = 30
@@ -158,17 +158,21 @@ class CrosswordGenerator:
     # ------------------------------------------------------------------
     def _seed_theme_words(self, grid: CrosswordGrid) -> List[ThemeWord]:
         LOGGER.info("Preparing theme words for '%s'", self.config.theme)
-        target = self.config.theme_request_size
+
+        playable_cells = grid._playable_count
+        min_theme_letters = max(1, int(playable_cells * self.config.min_theme_coverage))
+        letter_budget = max(min_theme_letters, int(playable_cells * self.config.max_theme_ratio))
+
+        # Auto-scale request size for larger grids
+        estimated_words_needed = (min_theme_letters // 5) + 2
+        target = max(self.config.theme_request_size, estimated_words_needed * 3)
+
         theme_words = merge_theme_generators(
             self.theme_generator, self.theme_fallback_generators, self.config.theme, target
         )
         if not theme_words:
             raise ThemeWordError("No theme words available")
 
-        playable_cells = grid._playable_count
-        letter_budget = max(1, int(playable_cells * 0.4))
-        min_theme_words = max(2, self.config.min_theme_words)
-        max_theme_words = 5
         letters_used = 0
         placed: List[ThemeWord] = []
         for theme_entry in theme_words:
@@ -177,11 +181,10 @@ class CrosswordGenerator:
                 continue
             if cleaned in self.used_words:
                 continue
-            if len(placed) >= max_theme_words:
-                break
-            if letters_used + len(cleaned) > letter_budget and len(placed) >= min_theme_words:
+            if letters_used >= letter_budget:
                 LOGGER.info(
-                    "Reached theme letter budget (%.2f%% of playable)",
+                    "Reached theme letter budget (%d letters, %.0f%% of playable)",
+                    letters_used,
                     (letters_used / playable_cells) * 100 if playable_cells else 0,
                 )
                 break
@@ -192,13 +195,22 @@ class CrosswordGenerator:
             placed.append(theme_entry)
             letters_used += len(cleaned)
 
-        if len(placed) < min_theme_words:
-            raise ThemeWordError("Insufficient theme words placed")
+        if letters_used < min_theme_letters:
+            raise ThemeWordError(
+                f"Insufficient theme coverage: {letters_used}/{min_theme_letters} letters "
+                f"({letters_used / playable_cells * 100:.0f}% vs "
+                f"{self.config.min_theme_coverage * 100:.0f}% target)"
+            )
 
         self.remaining_theme_words = {
             self.dictionary.sanitize(entry.word) for entry in theme_words if entry not in placed
         }
-        LOGGER.info("Placed %s theme words", len(placed))
+        LOGGER.info(
+            "Placed %s theme words (%d letters, %.0f%% of %d playable)",
+            len(placed), letters_used,
+            (letters_used / playable_cells) * 100 if playable_cells else 0,
+            playable_cells,
+        )
         return placed
 
     def _attempt_place_specific_word(

@@ -68,7 +68,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         "max_iterations": int,
         "retry_limit": int,
         "fill_timeout_seconds": float,
-        "min_theme_words": int,
+        "min_theme_coverage": float,
         "max_theme_ratio": float,
         "theme_request_size": int,
         "theme_placement_attempts": int,

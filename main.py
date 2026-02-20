@@ -31,6 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.85,
         help="Target fill ratio between 0 and 1",
     )
+    parser.add_argument(
+        "--min-theme-coverage",
+        type=float,
+        default=0.10,
+        help="Minimum fraction of playable cells covered by theme letters (default 0.10)",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--output", type=Path, help="Optional path to JSON output")
     parser.add_argument(
@@ -55,6 +61,7 @@ def main(argv: list[str] | None = None) -> None:
         theme=args.theme,
         seed=args.seed,
         completion_target=args.completion_target,
+        min_theme_coverage=args.min_theme_coverage,
     )
     generator = CrosswordGenerator(config)
     result = generator.generate()
