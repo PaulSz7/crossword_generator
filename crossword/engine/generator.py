@@ -47,11 +47,23 @@ class GeneratorConfig:
     fill_timeout_seconds: float = 180.0
     difficulty: str = "MEDIUM"
     language: str = "Romanian"
+    place_blocker_zone: bool = True
+    blocker_zone_height: Optional[int] = None
+    blocker_zone_width: Optional[int] = None
+    blocker_zone_row: Optional[int] = None
+    blocker_zone_col: Optional[int] = None
 
     def to_grid_config(self, seed_override: Optional[int] = None) -> GridConfig:
+        blocker_seed = self._manual_blocker_seed()
         return GridConfig(
             height=self.height,
             width=self.width,
+            place_blocker_zone=self.place_blocker_zone,
+            blocker_zone_height=self.blocker_zone_height,
+            blocker_zone_width=self.blocker_zone_width,
+            blocker_zone_row=self.blocker_zone_row,
+            blocker_zone_col=self.blocker_zone_col,
+            blocker_zone_seed=blocker_seed,
             rng_seed=seed_override if seed_override is not None else self.seed,
         )
 
@@ -61,6 +73,26 @@ class GeneratorConfig:
             rng=random.Random(self.seed),
             difficulty=Difficulty(self.difficulty),
         )
+
+    def _manual_blocker_seed(self) -> Optional[int]:
+        overrides = (
+            self.blocker_zone_height,
+            self.blocker_zone_width,
+            self.blocker_zone_row,
+            self.blocker_zone_col,
+        )
+        if not any(value is not None for value in overrides):
+            return None
+        # Deterministic 32-bit mixing derived from override values and optional seed
+        seed_value = 0x9E3779B1
+        for value in overrides:
+            component = -1 if value is None else int(value)
+            seed_value = (seed_value ^ (component + 0x7F4A7C15)) & 0xFFFFFFFF
+            seed_value = (seed_value * 0x45D9F3B) & 0xFFFFFFFF
+        if self.seed is not None:
+            seed_value = (seed_value ^ (self.seed & 0xFFFFFFFF)) & 0xFFFFFFFF
+            seed_value = (seed_value * 0x45D9F3B) & 0xFFFFFFFF
+        return seed_value & 0xFFFFFFFF
 
 
 @dataclass

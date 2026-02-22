@@ -95,6 +95,61 @@ class GridClueTests(unittest.TestCase):
         with self.assertRaises(SlotPlacementError):
             grid.ensure_terminal_boundary(slot)
 
+    def test_blocker_zone_override_applies_rectangle(self) -> None:
+        config = GridConfig(
+            height=10,
+            width=10,
+            blocker_zone_height=5,
+            blocker_zone_width=10,
+            blocker_zone_row=0,
+            blocker_zone_col=0,
+        )
+        grid = CrosswordGrid(config)
+        self.assertEqual(grid.blocker_zone, (0, 0, 5, 10))
+        for r in range(5):
+            for c in range(10):
+                self.assertEqual(grid.cell(r, c).type, CellType.BLOCKER_ZONE)
+
+    def test_blocker_zone_dimension_override_without_position(self) -> None:
+        config = GridConfig(
+            height=12,
+            width=10,
+            rng_seed=1234,
+            blocker_zone_height=4,
+            blocker_zone_width=8,
+        )
+        grid = CrosswordGrid(config)
+        blocker = grid.blocker_zone
+        self.assertIsNotNone(blocker)
+        assert blocker is not None
+        self.assertEqual(blocker[2], 4)
+        self.assertEqual(blocker[3], 8)
+        self.assertGreaterEqual(blocker[0], 0)
+        self.assertGreaterEqual(blocker[1], 0)
+        self.assertLessEqual(blocker[0] + 4, grid.bounds.rows)
+        self.assertLessEqual(blocker[1] + 8, grid.bounds.cols)
+
+    def test_blocker_zone_requires_both_coordinates(self) -> None:
+        config = GridConfig(height=6, width=6, blocker_zone_row=0)
+        with self.assertRaises(ValueError):
+            CrosswordGrid(config)
+
+    def test_generator_blocker_zone_seed_stable_across_retries(self) -> None:
+        gen_config = GeneratorConfig(
+            height=12,
+            width=10,
+            dictionary_path=Path("local_db/dex_words.tsv"),
+            theme="demo",
+            blocker_zone_height=4,
+            blocker_zone_width=6,
+        )
+        grid_conf_a = gen_config.to_grid_config(seed_override=42)
+        grid_conf_b = gen_config.to_grid_config(seed_override=1337)
+        self.assertEqual(grid_conf_a.blocker_zone_seed, grid_conf_b.blocker_zone_seed)
+        grid_a = CrosswordGrid(grid_conf_a)
+        grid_b = CrosswordGrid(grid_conf_b)
+        self.assertEqual(grid_a.blocker_zone, grid_b.blocker_zone)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

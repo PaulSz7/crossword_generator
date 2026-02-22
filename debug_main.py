@@ -41,6 +41,7 @@ DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "max_iterations": 8000,
     "fill_timeout_seconds": 75.0,
     "difficulty": "HARD",
+    "place_blocker_zone": False
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -76,6 +77,11 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         "prefer_theme_candidates": bool,
         "difficulty": str,
         "language": str,
+        "place_blocker_zone": bool,
+        "blocker_zone_height": int,
+        "blocker_zone_width": int,
+        "blocker_zone_row": int,
+        "blocker_zone_col": int,
     }
     for field, caster in optional_fields.items():
         if field in args:

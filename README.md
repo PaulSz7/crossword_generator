@@ -12,7 +12,7 @@ words in 5-16 seconds with near 100% success rate.
 - **OR-Tools CP-SAT solver**: Constraint satisfaction with table constraints and uniqueness
 - **Intelligent layout**: Partitions long runs (max 8-10 letters) to target 4-8 letter slots
 - **Theme word placement**: Places 2-5 theme words before layout completion
-- **Blocker zone placement**: Random corner/center placement adhering to project rules
+- **Blocker zone placement**: Random corner/center placement with optional CLI overrides
 - **TSV-based Romanian dictionary**: Preprocessing with diacritic normalization
 - **Structured JSON output**: Compatible with downstream renderers
 - **Configurable timeouts**: Automatic retry with fresh seeds if generation fails
@@ -32,6 +32,22 @@ python main.py --height 10 --width 15 --theme "mitologie" \
 
 The command above generates a 10×15 crossword with theme words related to "mitologie".
 The CP-SAT solver ensures 100% cell coverage in under 20 seconds.
+
+### Blocker zone controls
+
+You can disable blocker zone placement entirely or force a custom rectangle via CLI flags:
+
+```bash
+# Disable the blocker zone
+python main.py --height 10 --width 15 --theme "mitologie" --no-blocker-zone
+
+# Force a 5×10 top strip blocker zone (rows 0-4, cols 0-9)
+python main.py --height 20 --width 10 --theme "mitologie" \
+  --blocker-zone-height 5 --blocker-zone-width 10 --blocker-zone-row 0 --blocker-zone-col 0
+```
+
+Omit the `--blocker-zone-row/col` arguments to keep randomized placement while still
+overriding the rectangle dimensions.
 
 ### Dictionary preprocessing cache
 

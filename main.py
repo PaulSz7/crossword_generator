@@ -58,6 +58,31 @@ def build_parser() -> argparse.ArgumentParser:
         default="INFO",
         help="Logging level (DEBUG, INFO, WARNING, ERROR)",
     )
+    parser.add_argument(
+        "--no-blocker-zone",
+        action="store_true",
+        help="Disable BLOCKER_ZONE placement",
+    )
+    parser.add_argument(
+        "--blocker-zone-height",
+        type=int,
+        help="Override blocker zone height (rows)",
+    )
+    parser.add_argument(
+        "--blocker-zone-width",
+        type=int,
+        help="Override blocker zone width (columns)",
+    )
+    parser.add_argument(
+        "--blocker-zone-row",
+        type=int,
+        help="Override blocker zone start row",
+    )
+    parser.add_argument(
+        "--blocker-zone-col",
+        type=int,
+        help="Override blocker zone start column",
+    )
     return parser
 
 
@@ -66,6 +91,15 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     level = getattr(logging, args.log_level.upper(), logging.INFO)
     configure_logging(level)
+
+    override_fields = [
+        args.blocker_zone_height,
+        args.blocker_zone_width,
+        args.blocker_zone_row,
+        args.blocker_zone_col,
+    ]
+    if args.no_blocker_zone and any(value is not None for value in override_fields):
+        parser.error("--no-blocker-zone cannot be combined with blocker zone overrides")
 
     config = GeneratorConfig(
         height=args.height,
@@ -77,6 +111,11 @@ def main(argv: list[str] | None = None) -> None:
         min_theme_coverage=args.min_theme_coverage,
         difficulty=args.difficulty,
         language=args.language,
+        place_blocker_zone=not args.no_blocker_zone,
+        blocker_zone_height=args.blocker_zone_height,
+        blocker_zone_width=args.blocker_zone_width,
+        blocker_zone_row=args.blocker_zone_row,
+        blocker_zone_col=args.blocker_zone_col,
     )
     generator = CrosswordGenerator(config)
     result = generator.generate()

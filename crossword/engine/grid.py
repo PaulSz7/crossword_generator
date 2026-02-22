@@ -25,6 +25,11 @@ class GridConfig:
     min_blocker_size: int = 3
     max_blocker_size: int = 6
     place_blocker_zone: bool = True
+    blocker_zone_height: Optional[int] = None
+    blocker_zone_width: Optional[int] = None
+    blocker_zone_row: Optional[int] = None
+    blocker_zone_col: Optional[int] = None
+    blocker_zone_seed: Optional[int] = None
     rng_seed: Optional[int] = None
 
     def bounds(self) -> Bounds:
@@ -48,6 +53,11 @@ class CrosswordGrid:
         self.config = config
         self.bounds = config.bounds()
         self.rng = random.Random(config.rng_seed)
+        self._blocker_rng = (
+            random.Random(config.blocker_zone_seed)
+            if config.blocker_zone_seed is not None
+            else None
+        )
         self.cells: List[List[Cell]] = [
             [Cell() for _ in range(self.bounds.cols)] for _ in range(self.bounds.rows)
         ]
@@ -67,45 +77,142 @@ class CrosswordGrid:
         LOGGER.debug("Planting mandatory top-left clue box")
         self._add_clue_box(0, 0)
 
-    def place_blocker_zone(self) -> None:
-        """Place a blocker zone in a random corner or near the center."""
+    def place_blocker_zone(
+        self,
+        *,
+        start_row: Optional[int] = None,
+        start_col: Optional[int] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+    ) -> None:
+        """Place a blocker zone, optionally honoring explicit overrides."""
 
         if self.blocker_zone is not None:
             return
 
-        max_h = min(self.config.max_blocker_size, max(3, self.bounds.rows // 2))
-        max_w = min(self.config.max_blocker_size, max(3, self.bounds.cols // 2))
-        height = self.rng.randint(self.config.min_blocker_size, max_h)
-        width = self.rng.randint(self.config.min_blocker_size, max_w)
+        rng = self._blocker_rng or self.rng
 
-        anchors = [
-            (0, 0),  # top-left
-            (0, self.bounds.cols - width),  # top-right
-            (self.bounds.rows - height, 0),  # bottom-left
-            (self.bounds.rows - height, self.bounds.cols - width),  # bottom-right
-            ((self.bounds.rows - height) // 2, (self.bounds.cols - width) // 2),  # center
-        ]
-        start_row, start_col = self.rng.choice(anchors)
-        LOGGER.info(
-            "Placing blocker zone at (%s,%s) size %sx%s",
-            start_row,
-            start_col,
-            height,
-            width,
+        requested_height = (
+            height if height is not None else self.config.blocker_zone_height
+        )
+        requested_width = (
+            width if width is not None else self.config.blocker_zone_width
+        )
+        requested_row = (
+            start_row if start_row is not None else self.config.blocker_zone_row
+        )
+        requested_col = (
+            start_col if start_col is not None else self.config.blocker_zone_col
         )
 
-        for r in range(start_row, min(start_row + height, self.bounds.rows)):
-            for c in range(start_col, min(start_col + width, self.bounds.cols)):
+        max_h = min(
+            self.config.max_blocker_size,
+            max(3, self.bounds.rows // 2),
+            self.bounds.rows,
+        )
+        max_w = min(
+            self.config.max_blocker_size,
+            max(3, self.bounds.cols // 2),
+            self.bounds.cols,
+        )
+        min_h = min(self.config.min_blocker_size, max_h) if max_h else 1
+        min_w = min(self.config.min_blocker_size, max_w) if max_w else 1
+
+        def resolve_dimension(
+            requested: Optional[int],
+            *,
+            label: str,
+            default_min: int,
+            default_max: int,
+            limit: int,
+        ) -> int:
+            if requested is not None:
+                if requested <= 0:
+                    raise ValueError(f"Blocker zone {label} must be positive")
+                if requested > limit:
+                    raise ValueError(
+                        f"Blocker zone {label} {requested} exceeds grid {label} {limit}"
+                    )
+                return requested
+            upper = max(1, min(default_max, limit))
+            lower = max(1, min(default_min, upper))
+            return rng.randint(lower, upper)
+
+        zone_height = resolve_dimension(
+            requested_height,
+            label="height",
+            default_min=min_h,
+            default_max=max_h,
+            limit=self.bounds.rows,
+        )
+        zone_width = resolve_dimension(
+            requested_width,
+            label="width",
+            default_min=min_w,
+            default_max=max_w,
+            limit=self.bounds.cols,
+        )
+
+        if (requested_row is None) ^ (requested_col is None):
+            raise ValueError(
+                "blocker_zone_row and blocker_zone_col must both be provided when overriding"
+            )
+
+        if requested_row is not None and requested_col is not None:
+            start_row = requested_row
+            start_col = requested_col
+        else:
+            anchors = [
+                (0, 0),  # top-left
+                (0, self.bounds.cols - zone_width),  # top-right
+                (self.bounds.rows - zone_height, 0),  # bottom-left
+                (
+                    self.bounds.rows - zone_height,
+                    self.bounds.cols - zone_width,
+                ),  # bottom-right
+                (
+                    (self.bounds.rows - zone_height) // 2,
+                    (self.bounds.cols - zone_width) // 2,
+                ),  # center
+            ]
+            valid_anchors = [
+                (r, c)
+                for r, c in anchors
+                if 0 <= r <= self.bounds.rows - zone_height
+                and 0 <= c <= self.bounds.cols - zone_width
+            ]
+            if not valid_anchors:
+                raise ValueError("Unable to place blocker zone within grid bounds")
+            start_row, start_col = rng.choice(valid_anchors)
+
+        if start_row < 0 or start_col < 0:
+            raise ValueError("Blocker zone start coordinates must be non-negative")
+        if start_row + zone_height > self.bounds.rows or start_col + zone_width > self.bounds.cols:
+            raise ValueError("Blocker zone does not fit within the grid bounds")
+
+        override_flag = requested_height is not None or requested_width is not None or (
+            requested_row is not None and requested_col is not None
+        )
+        LOGGER.info(
+            "Placing blocker zone at (%s,%s) size %sx%s%s",
+            start_row,
+            start_col,
+            zone_height,
+            zone_width,
+            " [override]" if override_flag else "",
+        )
+
+        for r in range(start_row, start_row + zone_height):
+            for c in range(start_col, start_col + zone_width):
                 self._set_blocker_cell(r, c)
 
-        self.blocker_zone = (start_row, start_col, height, width)
+        self.blocker_zone = (start_row, start_col, zone_height, zone_width)
         if start_row == 0 and start_col == 0:
             # Plant clue boxes at the top-left of remaining playable areas.
-            h, w = height, width
-            if w < self.bounds.cols:
-                self._safe_add_clue_box(0, w)
-            if h < self.bounds.rows:
-                self._safe_add_clue_box(h, 0)
+            if zone_width < self.bounds.cols:
+                self._safe_add_clue_box(0, zone_width)
+            if zone_height < self.bounds.rows:
+                self._safe_add_clue_box(zone_height, 0)
 
     # ------------------------------------------------------------------
     # Cell manipulation
