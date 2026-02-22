@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..io.clues import ClueGenerator, ClueRequest, TemplateClueGenerator, attach_clues_to_grid
-from ..core.constants import CellType, Direction, ORTHOGONAL_STEPS
+from ..core.constants import CellType, Difficulty, Direction, ORTHOGONAL_STEPS
 from ..data.dictionary import DictionaryConfig, WordDictionary, WordEntry
 from ..core.exceptions import (ClueBoxError, CrosswordError, SlotPlacementError,
                                ThemeWordError, ValidationError)
@@ -45,6 +45,8 @@ class GeneratorConfig:
     theme_placement_attempts: int = 30
     prefer_theme_candidates: bool = True
     fill_timeout_seconds: float = 180.0
+    difficulty: str = "MEDIUM"
+    language: str = "Romanian"
 
     def to_grid_config(self, seed_override: Optional[int] = None) -> GridConfig:
         return GridConfig(
@@ -54,7 +56,11 @@ class GeneratorConfig:
         )
 
     def to_dictionary_config(self) -> DictionaryConfig:
-        return DictionaryConfig(path=self.dictionary_path, rng=random.Random(self.seed))
+        return DictionaryConfig(
+            path=self.dictionary_path,
+            rng=random.Random(self.seed),
+            difficulty=Difficulty(self.difficulty),
+        )
 
 
 @dataclass
@@ -111,16 +117,24 @@ class CrosswordGenerator:
     # ------------------------------------------------------------------
     # Public entrypoint
     # ------------------------------------------------------------------
+    # For EASY difficulty: number of full layout+theme retries using phase-1-only
+    # (easy words exclusively) before allowing medium fallback in phase 2.
+    _EASY_PHASE1_RETRIES = 3
+
     def generate(self) -> CrosswordResult:
         for attempt in range(1, self.config.retry_limit + 1):
             LOGGER.info("Generation attempt %s/%s", attempt, self.config.retry_limit)
+            allow_phase2 = (
+                self.config.difficulty != "EASY"
+                or attempt > self._EASY_PHASE1_RETRIES
+            )
             try:
                 grid_seed = self.rng.randint(0, 1_000_000)
                 grid = CrosswordGrid(self.config.to_grid_config(seed_override=grid_seed))
                 self._anneal_layout(grid)
                 theme_words = self._seed_theme_words(grid)
                 self._complete_layout(grid)
-                self._cpsat_fill(grid)
+                self._cpsat_fill(grid, allow_phase2=allow_phase2)
                 theme_word_surfaces = self.theme_word_surfaces.copy()
                 validation = self.validator.validate(grid, theme_word_surfaces)
                 if not validation.ok:
@@ -137,7 +151,9 @@ class CrosswordGenerator:
                     )
                     for slot in slots
                 ]
-                clue_texts = self.clue_generator.generate(clue_requests)
+                clue_texts = self.clue_generator.generate(
+                    clue_requests, difficulty=self.config.difficulty, language=self.config.language,
+                )
                 attach_clues_to_grid(grid, slots, clue_texts)
                 LOGGER.info("Crossword generation completed with %s words", len(slots))
                 return CrosswordResult(
@@ -168,7 +184,8 @@ class CrosswordGenerator:
         target = max(self.config.theme_request_size, estimated_words_needed * 3)
 
         theme_words = merge_theme_generators(
-            self.theme_generator, self.theme_fallback_generators, self.config.theme, target
+            self.theme_generator, self.theme_fallback_generators, self.config.theme, target,
+            difficulty=self.config.difficulty, language=self.config.language,
         )
         if not theme_words:
             raise ThemeWordError("No theme words available")
@@ -486,7 +503,7 @@ class CrosswordGenerator:
     # ------------------------------------------------------------------
     # CP-SAT filling
     # ------------------------------------------------------------------
-    def _cpsat_fill(self, grid: CrosswordGrid) -> None:
+    def _cpsat_fill(self, grid: CrosswordGrid, allow_phase2: bool = True) -> None:
         """Fill all unfilled slots using CP-SAT solver."""
         from .solver import solve_crossword
 
@@ -520,13 +537,65 @@ class CrosswordGenerator:
         LOGGER.info("CP-SAT: %d unfilled slots to fill (%d skipped unlicensable)",
                      len(licensable), len(unfilled) - len(licensable))
 
+        # Candidate cap controls tier purity for the CP-SAT solver.
+        # Candidates are sorted by WordEntry.score(), so earlier entries are
+        # always higher-priority for the active difficulty tier.
+        # EASY:   large pool — scoring gap (~0.86 vs ~0.24) ensures ≥95% easy
+        #         words in the primary pool; medium fallback only used if primary fails
+        # MEDIUM: large pool → no strict tier constraint, natural variety
+        # HARD:   medium cap → ~60% hard words; remainder are medium then easy
+        #         (direction bonus in score() ensures HARD > MEDIUM > EASY ordering)
+        _SOLVER_CANDIDATES = {"EASY": 2000, "MEDIUM": 8000, "HARD": 1500}
+
+        max_cands = _SOLVER_CANDIDATES.get(self.config.difficulty, 8000)
         timeout = min(30.0, self.config.fill_timeout_seconds)
-        result = solve_crossword(
-            grid, licensable, self.dictionary,
-            used_words=self.used_words,
-            theme_surfaces=self.theme_word_surfaces,
-            timeout=timeout,
-        )
+
+        # EASY: two-phase fill.
+        # Phase 1 (easy-only): hard DS ceiling guarantees no medium words slip in.
+        # Phase 2 (limited medium): only reached after _EASY_PHASE1_RETRIES full
+        # layout+theme attempts have all failed phase 1. Medium words are allowed
+        # only for slots that have zero easy candidates, capped at ~10% of slots.
+        if self.config.difficulty == "EASY":
+            phase1_timeout = timeout if not allow_phase2 else timeout * 0.7
+            result = solve_crossword(
+                grid, licensable, self.dictionary,
+                used_words=self.used_words,
+                theme_surfaces=self.theme_word_surfaces,
+                timeout=phase1_timeout,
+                max_candidates=max_cands,
+                fallback_fraction=0.0,
+                max_difficulty_score=0.3,
+                medium_slot_limit=0,
+            )
+            if result is None and allow_phase2:
+                # Each relaxed slot contributes at most 1 medium word.
+                # Dynamic cap: ~10% of fill slots, floor of 2.
+                medium_limit = max(2, len(licensable) // 10)
+                LOGGER.info(
+                    "EASY phase 1 failed; retrying with medium fallback for up to %d slot(s)",
+                    medium_limit,
+                )
+                result = solve_crossword(
+                    grid, licensable, self.dictionary,
+                    used_words=self.used_words,
+                    theme_surfaces=self.theme_word_surfaces,
+                    timeout=timeout * 0.3,
+                    max_candidates=max_cands,
+                    fallback_fraction=0.0,
+                    max_difficulty_score=0.3,
+                    medium_slot_limit=medium_limit,
+                )
+            elif result is None:
+                raise CrosswordError("CP-SAT phase 1 (easy-only) found no solution")
+        else:
+            result = solve_crossword(
+                grid, licensable, self.dictionary,
+                used_words=self.used_words,
+                theme_surfaces=self.theme_word_surfaces,
+                timeout=timeout,
+                max_candidates=max_cands,
+                fallback_fraction=0.0,
+            )
         if result is None:
             raise CrosswordError("CP-SAT solver found no solution")
 
@@ -918,4 +987,4 @@ class CrosswordGenerator:
         This method exists for backward compatibility with debug_main.step_fill().
         """
         self._complete_layout(grid)
-        self._cpsat_fill(grid)
+        self._cpsat_fill(grid, allow_phase2=True)

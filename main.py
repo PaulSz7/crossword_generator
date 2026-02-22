@@ -38,6 +38,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum fraction of playable cells covered by theme letters (default 0.10)",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument(
+        "--difficulty",
+        type=str,
+        choices=["EASY", "MEDIUM", "HARD"],
+        default="MEDIUM",
+        help="Difficulty level (EASY, MEDIUM, HARD)",
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default="Romanian",
+        help="Target language for clues and theme words",
+    )
     parser.add_argument("--output", type=Path, help="Optional path to JSON output")
     parser.add_argument(
         "--log-level",
@@ -62,6 +75,8 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         completion_target=args.completion_target,
         min_theme_coverage=args.min_theme_coverage,
+        difficulty=args.difficulty,
+        language=args.language,
     )
     generator = CrosswordGenerator(config)
     result = generator.generate()

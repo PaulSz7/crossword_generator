@@ -19,6 +19,12 @@ words in 5-16 seconds with near 100% success rate.
 
 ## Quick Start
 
+Export dictionary from db
+```bash
+mysql -u root dexonline --default-character-set=utf8mb4 --batch --quick < local_db/dex_query.sql > 
+local_db/dex_words.tsv
+```
+
 ```bash
 python main.py --height 10 --width 15 --theme "mitologie" \
   --dictionary local_db/dex_words.tsv --seed 42 --completion-target 1.0

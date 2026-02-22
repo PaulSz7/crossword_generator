@@ -24,18 +24,60 @@ class ClueRequest:
 
 
 class ClueGenerator(Protocol):
-    def generate(self, requests: List[ClueRequest]) -> Dict[str, str]:
+    def generate(self, requests: List[ClueRequest],
+                 difficulty: str = "MEDIUM", language: str = "Romanian") -> Dict[str, str]:
         """Return mapping from slot_id to clue text."""
 
 
 class GeminiClueGenerator:
     """LLM clue generator using Gemini."""
 
+    CLUE_RULES = (
+        "You are an expert cryptic crossword clue writer. "
+        "Write all clues in {language}. "
+        "Mandatory rules for EVERY clue:\n"
+        "1. Each clue must contain exactly one DEFINITION and one CRYPTIC MECHANISM.\n"
+        "2. The definition must be at the beginning or end of the clue, never in the middle.\n"
+        "3. The cryptic mechanism must produce exactly the letters of the solution word.\n"
+        "4. The clue must read naturally as a phrase or sentence in {language}.\n"
+        "5. Do NOT include the solution word (or obvious fragments) in the clue.\n"
+        "6. The clue must be between 3 and 8 words.\n"
+        "Respond as a JSON list [{{slot_id, clue}}]."
+    )
+
+    CLUE_DIFFICULTY_PROMPT = {
+        "EASY": (
+            "\nDifficulty: EASY. "
+            "Mechanisms: hidden word, double definition, simple anagram only. "
+            "Indicators: use transparent keywords. "
+            "Definition: direct synonym. "
+            "Surface reading: transparent. "
+            "Vocabulary: everyday words only."
+        ),
+        "MEDIUM": (
+            "\nDifficulty: MEDIUM. "
+            "Mechanisms: anagram, hidden word, double definition, container, reversal, deletion. "
+            "Indicators: subtle but recognizable. "
+            "Definition: periphrasis acceptable. "
+            "Surface reading: smooth misdirection. "
+            "Vocabulary: general vocabulary."
+        ),
+        "HARD": (
+            "\nDifficulty: HARD. "
+            "Mechanisms: all types including &lit, homophone, compound cryptic. "
+            "Indicators: double-meaning words as indicators. "
+            "Definition: misleading periphrasis. "
+            "Surface reading: deceptive at first glance. "
+            "Vocabulary: literary or rare vocabulary."
+        ),
+    }
+
     def __init__(self, model_name: str = "gemini-pro", api_key_env: str = "GOOGLE_API_KEY") -> None:
         self.model_name = model_name
         self.api_key_env = api_key_env
 
-    def generate(self, requests: List[ClueRequest]) -> Dict[str, str]:  # pragma: no cover - external
+    def generate(self, requests: List[ClueRequest],
+                 difficulty: str = "MEDIUM", language: str = "Romanian") -> Dict[str, str]:  # pragma: no cover - external
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise RuntimeError(
@@ -47,17 +89,20 @@ class GeminiClueGenerator:
             raise RuntimeError("google-generativeai package required for Gemini integration") from exc
 
         genai.configure(api_key=api_key)
-        prompt = self._render_prompt(requests)
+        prompt = self._render_prompt(requests, difficulty, language)
         response = genai.GenerativeModel(self.model_name).generate_content(prompt)
         return self._parse_response(response.text)
 
-    @staticmethod
-    def _render_prompt(requests: List[ClueRequest]) -> str:
+    @classmethod
+    def _render_prompt(cls, requests: List[ClueRequest],
+                       difficulty: str = "MEDIUM", language: str = "Romanian") -> str:
         payload = [request.__dict__ for request in requests]
+        rules = cls.CLUE_RULES.format(language=language)
+        diff_key = difficulty.upper() if difficulty else "MEDIUM"
+        diff_text = cls.CLUE_DIFFICULTY_PROMPT.get(diff_key, cls.CLUE_DIFFICULTY_PROMPT["MEDIUM"])
         return (
-            "Genereaza indicii criptice si directe in romana pentru fiecare intrare. "
-            "Raspunde ca lista JSON {slot_id, clue}. "
-            f"Solicitari: {json.dumps(payload, ensure_ascii=False)}"
+            f"{rules}{diff_text}\n"
+            f"Requests: {json.dumps(payload, ensure_ascii=False)}"
         )
 
     @staticmethod
@@ -81,7 +126,8 @@ class GeminiClueGenerator:
 class TemplateClueGenerator:
     """Simple fallback clue writer."""
 
-    def generate(self, requests: List[ClueRequest]) -> Dict[str, str]:
+    def generate(self, requests: List[ClueRequest],
+                 difficulty: str = "MEDIUM", language: str = "Romanian") -> Dict[str, str]:
         results = {}
         for req in requests:
             base = req.word.capitalize()

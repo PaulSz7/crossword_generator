@@ -26,6 +26,9 @@ def solve_crossword(
     theme_surfaces: Set[str],
     timeout: float = 30.0,
     max_candidates: int = 8000,
+    fallback_fraction: float = 0.0,
+    max_difficulty_score: Optional[float] = None,
+    medium_slot_limit: Optional[int] = None,
 ) -> Optional[List[Tuple]]:
     """Fill unfilled slots via CP-SAT.
 
@@ -37,6 +40,14 @@ def solve_crossword(
         theme_surfaces: Theme word surfaces for validation.
         timeout: Solver time limit in seconds.
         max_candidates: Max candidates per slot.
+        fallback_fraction: Fraction of each slot's candidate pool reserved for
+            the next-lower tier (passed through to find_candidates).
+        max_difficulty_score: Hard ceiling on candidate difficulty_score.
+            Candidates above this threshold are excluded from the solver pool.
+        medium_slot_limit: When set alongside max_difficulty_score, slots with
+            zero easy candidates are allowed to use the full (unfiltered) pool
+            instead of returning None immediately. If the number of such slots
+            exceeds this limit the call returns None (layout rejected).
 
     Returns:
         List of (SlotSignature, word_surface) pairs, or None if unsolvable.
@@ -65,6 +76,7 @@ def solve_crossword(
     # Step 2: Per-slot word candidates + table constraints
     # ------------------------------------------------------------------
     slot_candidates: Dict[str, List[str]] = {}
+    medium_slot_count = 0
 
     for slot in unfilled_slots:
         pattern = [grid.cell(r, c).letter for r, c in slot.cells]
@@ -73,7 +85,29 @@ def solve_crossword(
             candidates = dictionary.find_candidates(
                 slot.length, pattern=pattern,
                 banned=used_words, limit=max_candidates,
+                fallback_fraction=fallback_fraction,
             )
+            if max_difficulty_score is not None:
+                easy = [e for e in candidates if e.difficulty_score < max_difficulty_score]
+                if easy:
+                    candidates = easy
+                else:
+                    # No easy candidates for this slot — attempt per-slot relaxation.
+                    medium_slot_count += 1
+                    if medium_slot_limit is None or medium_slot_count > medium_slot_limit:
+                        LOGGER.debug(
+                            "No easy candidates for slot (%d,%d) dir=%s len=%d "
+                            "(medium slots so far: %d, limit: %s)",
+                            slot.start_row, slot.start_col, slot.direction.value,
+                            slot.length, medium_slot_count, medium_slot_limit,
+                        )
+                        return None  # reject: too many slots need medium words
+                    LOGGER.debug(
+                        "Slot (%d,%d) dir=%s len=%d gets medium fallback (%d/%s)",
+                        slot.start_row, slot.start_col, slot.direction.value,
+                        slot.length, medium_slot_count, medium_slot_limit,
+                    )
+                    # candidates already holds the full (unfiltered) pool
             surfaces = [e.surface for e in candidates]
         else:
             # 2-letter slots: generate all valid letter combos

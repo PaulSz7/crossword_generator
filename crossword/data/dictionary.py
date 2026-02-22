@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from ..core.constants import Difficulty
 from ..core.exceptions import DictionaryLoadError
 from .normalization import clean_word
 from .preprocess import (
@@ -32,6 +33,10 @@ class DictionaryConfig:
     processed_cache: Path | str | None = None
     persist_processed_cache: bool = True
     rng: Optional[random.Random] = None
+    difficulty: Difficulty = Difficulty.MEDIUM
+
+
+_TIER_CENTER = {Difficulty.EASY: 0.15, Difficulty.MEDIUM: 0.45, Difficulty.HARD: 0.80}
 
 
 @dataclass
@@ -46,14 +51,29 @@ class WordEntry:
     frequency: float
     is_compound: bool
     is_stopword: bool
+    difficulty_score: float = 0.0
 
-    def score(self) -> float:
-        penalty = 0.0
+    def score(self, difficulty: Difficulty = Difficulty.MEDIUM) -> float:
+        base = self.frequency
         if self.is_compound:
-            penalty += 0.15
+            base -= 0.15
         if self.is_stopword:
-            penalty += 0.3
-        return max(self.frequency - penalty, 0.0)
+            base -= 0.3
+
+        distance = abs(self.difficulty_score - _TIER_CENTER[difficulty])
+        affinity = max(0.0, 1.0 - distance * 3.5)
+
+        # Direction bonus: ensures off-tier words follow the right priority order.
+        # Without this, high-frequency easy words outscore medium words for HARD
+        # difficulty (and vice-versa), breaking HARD > MEDIUM > EASY ordering.
+        if difficulty == Difficulty.EASY:
+            direction = 1.0 - self.difficulty_score  # prefer lower DS
+        elif difficulty == Difficulty.HARD:
+            direction = self.difficulty_score         # prefer higher DS
+        else:
+            direction = 0.5                           # neutral for MEDIUM
+
+        return max(0.0, base * 0.15 + affinity * 0.55 + direction * 0.30)
 
 
 class WordDictionary:
@@ -99,8 +119,9 @@ class WordDictionary:
         self._hydrate_entries(records)
 
         if self.config.max_entries_per_length:
+            difficulty = self.config.difficulty
             for length, entries in list(self._entries_by_length.items()):
-                entries.sort(key=lambda e: e.score(), reverse=True)
+                entries.sort(key=lambda e: e.score(difficulty), reverse=True)
                 self._entries_by_length[length] = entries[: self.config.max_entries_per_length]
         self._finalize_letter_stats()
 
@@ -124,6 +145,7 @@ class WordDictionary:
                 frequency=record.frequency,
                 is_compound=record.is_compound,
                 is_stopword=record.is_stopword,
+                difficulty_score=record.difficulty_score,
             )
             self._entry_by_surface[entry.surface] = entry
             self._entries_by_length[entry.length].append(entry)
@@ -167,11 +189,16 @@ class WordDictionary:
         banned: Optional[Set[str]] = None,
         preferred: Optional[Set[str]] = None,
         limit: int = 50,
+        fallback_fraction: float = 0.0,
     ) -> List[WordEntry]:
         """Return candidates matching the supplied constraints.
 
         ``pattern`` is a sequence describing each cell (letter or ``None``).
         ``preferred`` boosts scoring for theme or high-priority entries.
+        ``fallback_fraction`` reserves that fraction of ``limit`` for words
+        scored by the next-lower difficulty tier (MEDIUM for EASY, MEDIUM for
+        HARD), guaranteeing the solver always has off-tier backup candidates.
+        Has no effect when difficulty is MEDIUM.
         """
 
         banned = banned or set()
@@ -187,14 +214,35 @@ class WordDictionary:
 
         entries = [self._entry_by_surface[s] for s in matching if s in self._entry_by_surface]
 
+        difficulty = self.config.difficulty
+
         def boosted_score(item: WordEntry) -> float:
-            score = item.score()
+            score = item.score(difficulty)
             if item.surface in preferred:
                 score *= 1.4
             return score
 
         entries.sort(key=boosted_score, reverse=True)
-        return entries[:limit]
+
+        if fallback_fraction <= 0.0 or difficulty == Difficulty.MEDIUM:
+            return entries[:limit]
+
+        # Split the limit: primary tier gets (1 - fallback_fraction), secondary
+        # gets fallback_fraction.  Secondary candidates are scored by MEDIUM so
+        # the best medium-tier words are chosen regardless of whether difficulty
+        # is EASY (medium > easy) or HARD (medium < hard).
+        fallback_n = max(1, round(limit * fallback_fraction))
+        primary_n = limit - fallback_n
+
+        primary = entries[:primary_n]
+        primary_surfaces = {e.surface for e in primary}
+
+        # Score remaining matches by MEDIUM and pick the top fallback_n
+        secondary_pool = [e for e in entries[primary_n:] if e.surface not in primary_surfaces]
+        secondary_pool.sort(key=lambda e: e.score(Difficulty.MEDIUM), reverse=True)
+        secondary = secondary_pool[:fallback_n]
+
+        return primary + secondary
 
     def _index_lookup(
         self,
@@ -272,11 +320,12 @@ class WordDictionary:
         if key in self._theme_cache:
             return self._theme_cache[key][:limit]
 
+        difficulty = self.config.difficulty
         matches: List[Tuple[float, WordEntry]] = []
         for entry in self._entry_by_surface.values():
             haystack = f"{entry.definition} {entry.lemma}".lower()
             if key in haystack:
-                matches.append((entry.score(), entry))
+                matches.append((entry.score(difficulty), entry))
 
         matches.sort(key=lambda item: item[0], reverse=True)
         selected = [entry for _, entry in matches[:limit]]

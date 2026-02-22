@@ -29,17 +29,18 @@ from crossword.engine.grid import CrosswordGrid
 from crossword.data.preprocess import ensure_processed_dictionary
 from crossword.io.clues import ClueRequest, attach_clues_to_grid
 from crossword.utils.logger import configure_logging
-from crossword.utils.pretty import pretty_print_grid
+from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
 
 DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
-    "height": 20,
-    "width": 15,
+    "height": 10,
+    "width": 12,
     "theme": "mitologie",
     "dictionary_path": Path("local_db/dex_words.tsv"),
     "seed": None,
     "completion_target": 1,
     "max_iterations": 8000,
     "fill_timeout_seconds": 75.0,
+    "difficulty": "HARD",
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -73,6 +74,8 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         "theme_request_size": int,
         "theme_placement_attempts": int,
         "prefer_theme_candidates": bool,
+        "difficulty": str,
+        "language": str,
     }
     for field, caster in optional_fields.items():
         if field in args:
@@ -173,10 +176,6 @@ def step_clues(state: Dict[str, Any]):
     state["clue_texts"] = state["generator"].clue_generator.generate(requests)
     attach_clues_to_grid(state["grid"], state["slots"], state["clue_texts"])
     return state["clue_texts"]
-
-
-def show_grid(state: Dict[str, Any], label: str | None = None) -> None:
-    pretty_print_grid(state["grid"], label=label)
 
 
 def build_result(state: Dict[str, Any]) -> CrosswordResult:
@@ -290,12 +289,14 @@ def _run_single_attempt(
     step_seed_theme(state, retries=theme_retries)
     pretty_print_grid(state['grid'])
     step_fill(state)
-    pretty_print_grid(state['grid'])
     validation = step_validate(state)
     if validation and not validation.ok:
+        pretty_print_grid(state['grid'])
         raise CrosswordError(f"Validation failed: {validation.messages}")
     step_clues(state)
-    return build_result(state)
+    result = build_result(state)
+    print_crossword_stats(result, state["generator"].dictionary)
+    return result
 
 
 def main() -> None:  # pragma: no cover - manual helper

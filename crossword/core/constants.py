@@ -7,6 +7,14 @@ from enum import Enum
 from typing import Tuple
 
 
+class Difficulty(str, Enum):
+    """Crossword difficulty levels."""
+
+    EASY = "EASY"
+    MEDIUM = "MEDIUM"
+    HARD = "HARD"
+
+
 class CellType(str, Enum):
     """All supported cell types in the grid."""
 

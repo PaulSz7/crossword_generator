@@ -26,7 +26,10 @@ class ThemeWord:
 class ThemeWordGenerator(Protocol):
     """Protocol implemented by all theme word providers."""
 
-    def generate(self, theme: str, limit: int = 80) -> List[ThemeWord]:
+    def generate(
+        self, theme: str, limit: int = 80,
+        difficulty: str = "MEDIUM", language: str = "Romanian",
+    ) -> List[ThemeWord]:
         ...
 
 
@@ -37,7 +40,33 @@ class GeminiThemeWordGenerator:
         self.model_name = model_name
         self.api_key_env = api_key_env
 
-    def generate(self, theme: str, limit: int = 80) -> List[ThemeWord]:  # pragma: no cover - external
+    THEME_BASE_PROMPT = (
+        "You are assisting with a {language} cryptic crossword. "
+        "Generate between 50 and {limit} JSON lines describing unique theme words. "
+        "Theme: '{theme}'. Each JSON line must contain fields: word, clue. "
+        "The clue must be 3-5 words in {language}, cryptic-friendly. "
+        "Output no more than {limit} entries."
+    )
+
+    THEME_DIFFICULTY_PROMPT = {
+        "EASY": (
+            "Target audience: beginners. Use only well-known, common {language} words. "
+            "Clues: straightforward definitions or simple wordplay. Avoid obscure words."
+        ),
+        "MEDIUM": (
+            "Target audience: regular solvers. Mix common and moderately challenging {language} words. "
+            "Clues: cryptic conventions (anagrams, double meanings, hidden words)."
+        ),
+        "HARD": (
+            "Target audience: experts. Prefer rare, literary, or domain-specific {language} words. "
+            "Clues: advanced cryptic techniques (complex anagrams, misdirection, obscure references)."
+        ),
+    }
+
+    def generate(
+        self, theme: str, limit: int = 80,
+        difficulty: str = "MEDIUM", language: str = "Romanian",
+    ) -> List[ThemeWord]:  # pragma: no cover - external
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise RuntimeError(
@@ -49,19 +78,17 @@ class GeminiThemeWordGenerator:
             raise RuntimeError("google-generativeai package required for Gemini integration") from exc
 
         genai.configure(api_key=api_key)
-        prompt = self._render_prompt(theme, limit)
+        prompt = self._render_prompt(theme, limit, difficulty, language)
         response = genai.GenerativeModel(self.model_name).generate_content(prompt)
         return self._parse_response(response.text)
 
-    @staticmethod
-    def _render_prompt(theme: str, limit: int) -> str:
-        return (
-            "You are assisting with a Romanian cryptic crossword. "
-            "Generate between 50 and 100 JSON lines describing unique theme words. "
-            f"Theme: '{theme}'. Each JSON line should contain fields word, clue. "
-            "The clue must be 3-4 Romanian words, cryptic-friendly."
-            f" Output no more than {limit} entries."
-        )
+    @classmethod
+    def _render_prompt(cls, theme: str, limit: int,
+                       difficulty: str = "MEDIUM", language: str = "Romanian") -> str:
+        base = cls.THEME_BASE_PROMPT.format(language=language, limit=limit, theme=theme)
+        diff_key = difficulty.upper() if difficulty else "MEDIUM"
+        diff_text = cls.THEME_DIFFICULTY_PROMPT.get(diff_key, cls.THEME_DIFFICULTY_PROMPT["MEDIUM"])
+        return base + " " + diff_text.format(language=language)
 
     @staticmethod
     def _parse_response(text: str) -> List[ThemeWord]:
@@ -84,142 +111,106 @@ class GeminiThemeWordGenerator:
 
 
 DEFAULT_THEME_BUCKETS = {
-    "mitologie": [
-        "APOLON",
-        "ARES",
-        "ATHENA",
-        "HERA",
-        "IRIS",
-        "HERMES",
-        "ANUBIS",
-        "ODIN",
-        "FREIA",
-        "THOR",
-        "HESTIA",
-        "PAN",
-        "SATIR",
-        "MINERVA",
-        "CERES",
-        "DIANA",
-        "EOL",
-        "NEMESIS",
-        "EROS",
-        "AURORA",
-        "HELIOS",
-        "MORPHEU",
-        "ORACOL",
-        "SIRENA",
-        "TITAN",
-        "ATLAS",
-        "NEREIDA",
-        "FAUN",
-        "OSIRIS",
-        "LIBER",
-    ],
-    "istorie": [
-        "REGAT",
-        "LEGIE",
-        "TRON",
-        "CRONIC",
-        "VOIEVOD",
-        "ARHIVA",
-        "ARMURA",
-        "CASTRA",
-        "ARCA",
-        "DICTUM",
-        "PACT",
-        "RELICVA",
-        "SENAT",
-        "PATRIA",
-        "ARMATA",
-        "COLONIE",
-        "CANON",
-        "DOMNIE",
-        "TRIBUT",
-        "REGE",
-        "LEGAT",
-        "PORTIC",
-        "CRONICAR",
-        "TABELA",
-        "FORT",
-        "OPERA",
-        "EDICT",
-        "SIGILIU",
-        "CRONICA",
-    ],
-    "natura": [
-        "MUNTE",
-        "BRAD",
-        "LUP",
-        "CERB",
-        "CODRU",
-        "RAPID",
-        "IZVOR",
-        "VALURI",
-        "STANCA",
-        "ALBIA",
-        "LUNCA",
-        "PODIS",
-        "DELTA",
-        "PLOAIE",
-        "CAMP",
-        "OGOR",
-        "IARBA",
-        "MOLID",
-        "RACHIT",
-        "SIRET",
-        "APUS",
-        "FRUNZA",
-        "TRESTIE",
-        "PRAFUL",
-        "PAMANT",
-        "AURORA",
-        "OCEAN",
-        "CASCADA",
-        "FAG",
-        "ARIN",
-    ],
+    "mitologie": {
+        "EASY": [
+            "APOLON", "ARES", "ATHENA", "HERA", "IRIS", "HERMES", "ODIN",
+            "THOR", "DIANA", "EROS", "AURORA", "TITAN", "ATLAS", "PAN",
+            "ZEUS", "POSEIDON", "ISIS", "RA",
+        ],
+        "MEDIUM": [
+            "ANUBIS", "FREIA", "MINERVA", "CERES", "NEMESIS", "HELIOS",
+            "SIRENA", "FAUN", "OSIRIS", "DEMETER", "JANUS", "BALDER", "TETHYS",
+        ],
+        "HARD": [
+            "HESTIA", "SATIR", "EOL", "MORPHEU", "ORACOL", "NEREIDA", "LIBER",
+            "CHARON", "ERINIE", "HYPERION", "PROTEU",
+        ],
+    },
+    "istorie": {
+        "EASY": [
+            "REGAT", "ARMATA", "REGE", "PATRIA", "SENAT", "FORT", "OPERA",
+            "PACT", "COLONIE", "CRONICA", "STEAG", "SCUT", "HARTA", "CRUCE",
+        ],
+        "MEDIUM": [
+            "LEGIE", "TRON", "VOIEVOD", "ARHIVA", "ARMURA", "CANON",
+            "DOMNIE", "TRIBUT", "LEGAT", "TABELA", "DINASTIE", "HERALD",
+            "ARMISTITIU", "CRONOGRAF",
+        ],
+        "HARD": [
+            "CRONIC", "CASTRA", "ARCA", "DICTUM", "RELICVA", "PORTIC",
+            "CRONICAR", "EDICT", "SIGILIU", "PAPIRUS", "PALIMPSEST", "TRIREMA",
+        ],
+    },
+    "natura": {
+        "EASY": [
+            "MUNTE", "BRAD", "LUP", "CERB", "PLOAIE", "CAMP", "IARBA",
+            "PAMANT", "OCEAN", "DELTA", "FRUNZA", "LAC", "NISIP", "VANT", "RAPITA",
+        ],
+        "MEDIUM": [
+            "CODRU", "IZVOR", "STANCA", "LUNCA", "PODIS", "OGOR", "APUS",
+            "CASCADA", "FAG", "AURORA", "DESERT", "GROTA", "PENINSULA", "ECOSISTEM",
+        ],
+        "HARD": [
+            "RAPID", "VALURI", "ALBIA", "MOLID", "RACHIT", "SIRET",
+            "TRESTIE", "PRAFUL", "ARIN", "GORUN", "ESTUAR", "ZADA", "LIMAN",
+        ],
+    },
 }
 
-FALLBACK_BUCKET = [
-    "ROMA",
-    "DUNARE",
-    "CARPA",
-    "SOLAR",
-    "RITUAL",
-    "LEGAT",
-    "PATRU",
-    "CLIPA",
-    "VIATA",
-    "LUMEA",
-    "CAMPIE",
-    "POD",
-    "RAZBOI",
-    "CLASA",
-    "ACORD",
-    "PIATA",
-    "COLINA",
-    "PORT",
-    "CETATE",
-]
+FALLBACK_BUCKET = {
+    "EASY": [
+        "ROMA", "DUNARE", "SOLAR", "VIATA", "LUMEA", "PIATA", "PORT", "CETATE",
+    ],
+    "MEDIUM": [
+        "CARPA", "RITUAL", "LEGAT", "CLIPA", "CAMPIE", "RAZBOI", "ACORD",
+    ],
+    "HARD": [
+        "PATRU", "POD", "CLASA", "COLINA",
+    ],
+}
 
 
 class DummyThemeWordGenerator:
     """Produces placeholder theme words from predefined buckets."""
 
-    def __init__(self, theme_buckets: dict[str, List[str]] | None = None, seed: int | None = None) -> None:
+    def __init__(self, theme_buckets: dict[str, dict[str, List[str]]] | None = None, seed: int | None = None) -> None:
         buckets = theme_buckets or DEFAULT_THEME_BUCKETS
-        self.theme_buckets = {key: [w.upper() for w in words if w] for key, words in buckets.items()}
+        self.theme_buckets: dict[str, dict[str, List[str]]] = {}
+        for key, tier_map in buckets.items():
+            self.theme_buckets[key] = {
+                tier: [w.upper() for w in words if w]
+                for tier, words in tier_map.items()
+            }
         self.rng = random.Random(seed)
 
-    def generate(self, theme: str, limit: int = 30) -> List[ThemeWord]:
+    def generate(
+        self, theme: str, limit: int = 30,
+        difficulty: str = "MEDIUM", language: str = "Romanian",
+    ) -> List[ThemeWord]:
         key = (theme or "").strip().lower()
-        words = list(self.theme_buckets.get(key, FALLBACK_BUCKET))
-        words = [w.upper() for w in words if w]
-        if not words:
-            words = FALLBACK_BUCKET
-        self.rng.shuffle(words)
-        selections = words[: max(limit, 5)]
+        tier = difficulty.upper() if difficulty else "MEDIUM"
+        tier_map = self.theme_buckets.get(key, FALLBACK_BUCKET)
+
+        # Prefer on-tier words, then fall back to other tiers
+        on_tier = list(tier_map.get(tier, []))
+        off_tier: List[str] = []
+        for t, words in tier_map.items():
+            if t != tier:
+                off_tier.extend(words)
+
+        self.rng.shuffle(on_tier)
+        self.rng.shuffle(off_tier)
+        combined = on_tier + off_tier
+        combined = [w.upper() for w in combined if w]
+
+        if not combined:
+            # Ultimate fallback: flatten FALLBACK_BUCKET
+            flat = []
+            for words in FALLBACK_BUCKET.values():
+                flat.extend(words)
+            combined = flat
+
+        selections = combined[: max(limit, 5)]
         results = [
             ThemeWord(
                 word=word,
@@ -228,7 +219,7 @@ class DummyThemeWordGenerator:
             )
             for word in selections[:limit]
         ]
-        LOGGER.info("Dummy generator produced %s placeholders", len(results))
+        LOGGER.info("Dummy generator produced %s placeholders (tier=%s)", len(results), tier)
         return results
 
 
@@ -237,6 +228,8 @@ def merge_theme_generators(
     fallbacks: Sequence[ThemeWordGenerator],
     theme: str,
     target: int,
+    difficulty: str = "MEDIUM",
+    language: str = "Romanian",
 ) -> List[ThemeWord]:
     """Attempt primary generator, cascaded fallbacks, and deduplicate results."""
 
@@ -255,7 +248,7 @@ def merge_theme_generators(
 
     if primary:
         try:
-            extend(primary.generate(theme, limit=target))
+            extend(primary.generate(theme, limit=target, difficulty=difficulty, language=language))
         except Exception as exc:  # pragma: no cover - integration only
             LOGGER.warning("Primary theme generator failed: %s", exc)
 
@@ -263,7 +256,7 @@ def merge_theme_generators(
         if len(collected) >= target:
             break
         try:
-            extend(generator.generate(theme, limit=target))
+            extend(generator.generate(theme, limit=target, difficulty=difficulty, language=language))
         except Exception as exc:
             LOGGER.warning("Fallback theme generator %s failed: %s", generator, exc)
 
