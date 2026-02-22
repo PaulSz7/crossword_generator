@@ -110,6 +110,28 @@ class GeminiThemeWordGenerator:
         return entries
 
 
+class UserWordListGenerator:
+    """Returns a user-supplied list of words as ThemeWord objects."""
+
+    def __init__(self, raw_words: List[str]) -> None:
+        self._theme_words: List[ThemeWord] = []
+        for item in raw_words:
+            item = item.strip()
+            if not item:
+                continue
+            if ":" in item:
+                word, _, clue = item.partition(":")
+                self._theme_words.append(ThemeWord(word.strip().upper(), clue.strip(), "user"))
+            else:
+                self._theme_words.append(ThemeWord(item.upper(), "", "user"))
+
+    def generate(
+        self, theme: str, limit: int = 80,
+        difficulty: str = "MEDIUM", language: str = "Romanian",
+    ) -> List[ThemeWord]:
+        return list(self._theme_words)
+
+
 DEFAULT_THEME_BUCKETS = {
     "mitologie": {
         "EASY": [

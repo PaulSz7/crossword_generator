@@ -34,7 +34,7 @@ class GeneratorConfig:
     height: int
     width: int
     dictionary_path: Path | str
-    theme: str
+    theme: str = ""
     seed: Optional[int] = None
     completion_target: float = 0.85
     max_iterations: int = 2500
@@ -125,14 +125,17 @@ class CrosswordGenerator:
         dictionary: Optional[WordDictionary] = None,
         theme_generator: Optional[ThemeWordGenerator] = None,
         clue_generator: Optional[ClueGenerator] = None,
+        theme_fallback_generators: Optional[List[ThemeWordGenerator]] = None,
     ) -> None:
         self.config = config
         self.rng = random.Random(config.seed)
         self.dictionary = dictionary or WordDictionary(config.to_dictionary_config())
         self.theme_generator = theme_generator
-        self.theme_fallback_generators = [
-            DummyThemeWordGenerator(seed=config.seed),
-        ]
+        self.theme_fallback_generators = (
+            theme_fallback_generators
+            if theme_fallback_generators is not None
+            else [DummyThemeWordGenerator(seed=config.seed)]
+        )
         self.clue_generator = clue_generator or TemplateClueGenerator()
         self.validator = GridValidator(self.dictionary)
         self.used_words: Set[str] = set()
@@ -238,17 +241,23 @@ class CrosswordGenerator:
                 )
                 break
             if not self._attempt_place_specific_word(
-                grid, cleaned, theme_entry, is_theme=True
+                grid, cleaned, theme_entry, is_theme=True,
+                skip_crossing_validation=theme_entry.source == "user",
             ):
                 continue
             placed.append(theme_entry)
             letters_used += len(cleaned)
 
-        if letters_used < min_theme_letters:
+        if letters_used < min_theme_letters and self.theme_fallback_generators:
             raise ThemeWordError(
                 f"Insufficient theme coverage: {letters_used}/{min_theme_letters} letters "
                 f"({letters_used / playable_cells * 100:.0f}% vs "
                 f"{self.config.min_theme_coverage * 100:.0f}% target)"
+            )
+        if letters_used < min_theme_letters:
+            LOGGER.info(
+                "Words-only mode: skipping coverage check (%d/%d letters placed)",
+                letters_used, min_theme_letters,
             )
 
         self.remaining_theme_words = {
@@ -268,8 +277,9 @@ class CrosswordGenerator:
         word: str,
         theme_entry: Optional[ThemeWord] = None,
         is_theme: bool = False,
+        skip_crossing_validation: bool = False,
     ) -> bool:
-        if self._attempt_pending_start(grid, word, theme_entry, is_theme):
+        if self._attempt_pending_start(grid, word, theme_entry, is_theme, skip_crossing_validation):
             return True
 
         for _ in range(self.config.theme_placement_attempts):
@@ -279,7 +289,8 @@ class CrosswordGenerator:
                 continue
             start_row, start_col = self.rng.choice(start_positions)
             if self._place_word_at(
-                grid, word, theme_entry, is_theme, direction, start_row, start_col
+                grid, word, theme_entry, is_theme, direction, start_row, start_col,
+                skip_crossing_validation=skip_crossing_validation,
             ):
                 return True
         return False
@@ -290,10 +301,12 @@ class CrosswordGenerator:
         word: str,
         theme_entry: Optional[ThemeWord],
         is_theme: bool,
+        skip_crossing_validation: bool = False,
     ) -> bool:
         while self.pending_starts:
             _, _, (row, col, direction) = heapq.heappop(self.pending_starts)
-            if self._place_word_at(grid, word, theme_entry, is_theme, direction, row, col):
+            if self._place_word_at(grid, word, theme_entry, is_theme, direction, row, col,
+                                   skip_crossing_validation=skip_crossing_validation):
                 return True
         return False
 
@@ -306,6 +319,7 @@ class CrosswordGenerator:
         direction: Direction,
         start_row: int,
         start_col: int,
+        skip_crossing_validation: bool = False,
     ) -> bool:
         if not self._can_place_word(grid, start_row, start_col, direction, word):
             return False
@@ -327,7 +341,8 @@ class CrosswordGenerator:
 
         try:
             grid.place_word(slot, word)
-            self._validate_crossings(grid, slot)
+            if not skip_crossing_validation:
+                self._validate_crossings(grid, slot)
             extension = grid.ensure_terminal_boundary(slot)
         except (ClueBoxError, SlotPlacementError) as exc:
             if slot.id in grid.word_slots:

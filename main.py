@@ -6,10 +6,21 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig
 from crossword.utils.logger import configure_logging
+
+
+def parse_words_file(path: Path) -> List[str]:
+    """Read words from a file, one entry per line. Blank lines and # comments are skipped."""
+    entries: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.append(line)
+    return entries
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -18,7 +29,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--height", type=int, required=True, help="Grid height in cells")
     parser.add_argument("--width", type=int, required=True, help="Grid width in cells")
-    parser.add_argument("--theme", type=str, required=True, help="Theme description")
+    parser.add_argument("--theme", type=str, default="", help="Theme description")
+    parser.add_argument(
+        "--words",
+        nargs="+",
+        metavar="WORD",
+        help="Explicit seed words (format: WORD or WORD:Clue)",
+    )
+    parser.add_argument(
+        "--words-file",
+        type=Path,
+        metavar="FILE",
+        help="File with one WORD or WORD:Clue entry per line (# comments and blank lines ignored)",
+    )
+    parser.add_argument(
+        "--llm",
+        action="store_true",
+        help="Extend user-provided words with LLM-generated theme words (requires --theme)",
+    )
+    parser.add_argument(
+        "--theme-description",
+        type=str,
+        default="",
+        help="Additional context for the LLM prompt when --llm is used",
+    )
     parser.add_argument(
         "--dictionary",
         type=Path,
@@ -101,11 +135,29 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_blocker_zone and any(value is not None for value in override_fields):
         parser.error("--no-blocker-zone cannot be combined with blocker zone overrides")
 
+    # Validate mode flags
+    if args.llm and not args.theme:
+        parser.error("--llm requires --theme")
+    if not args.theme and not args.words and not args.words_file:
+        parser.error("provide at least --theme or --words / --words-file")
+
+    # Collect user-provided words
+    user_words: List[str] = []
+    if args.words:
+        user_words.extend(args.words)
+    if args.words_file:
+        user_words.extend(parse_words_file(args.words_file))
+
+    # Determine effective theme string
+    theme_str = args.theme
+    if args.llm and args.theme_description:
+        theme_str = f"{args.theme}: {args.theme_description}"
+
     config = GeneratorConfig(
         height=args.height,
         width=args.width,
         dictionary_path=args.dictionary,
-        theme=args.theme,
+        theme=theme_str,
         seed=args.seed,
         completion_target=args.completion_target,
         min_theme_coverage=args.min_theme_coverage,
@@ -117,7 +169,24 @@ def main(argv: list[str] | None = None) -> None:
         blocker_zone_row=args.blocker_zone_row,
         blocker_zone_col=args.blocker_zone_col,
     )
-    generator = CrosswordGenerator(config)
+
+    # Wire up generators based on mode
+    theme_gen = None
+    fallbacks = None  # None → CrosswordGenerator will use default [DummyThemeWordGenerator]
+
+    if user_words:
+        from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator
+        theme_gen = UserWordListGenerator(user_words)
+        if args.llm:
+            fallbacks = [GeminiThemeWordGenerator(), DummyThemeWordGenerator(seed=config.seed)]
+        else:
+            fallbacks = []
+
+    generator = CrosswordGenerator(
+        config,
+        theme_generator=theme_gen,
+        theme_fallback_generators=fallbacks,
+    )
     result = generator.generate()
 
     payload: Dict[str, Any] = {

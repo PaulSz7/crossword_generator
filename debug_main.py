@@ -27,21 +27,30 @@ from crossword.core.exceptions import CrosswordError, ThemeWordError
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig, CrosswordResult
 from crossword.engine.grid import CrosswordGrid
 from crossword.data.preprocess import ensure_processed_dictionary
+from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator
 from crossword.io.clues import ClueRequest, attach_clues_to_grid
 from crossword.utils.logger import configure_logging
 from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
 
 DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "height": 10,
-    "width": 12,
+    "width": 8,
     "theme": "mitologie",
+    "words": ["ZEUS", "THOR"],           # list of "WORD" or "WORD:Clue" strings
+    "words_file": None,    # Path or str to a words file
+    "llm": True,          # extend user words via Gemini (requires theme)
+    "theme_description": "",  # extra context appended to theme for LLM
     "dictionary_path": Path("local_db/dex_words.tsv"),
     "seed": None,
     "completion_target": 1,
     "max_iterations": 8000,
     "fill_timeout_seconds": 75.0,
-    "difficulty": "HARD",
-    "place_blocker_zone": False
+    "difficulty": "EASY",
+    "place_blocker_zone": False,
+    # "blocker_zone_height": None,
+    # "blocker_zone_width": None,
+    # "blocker_zone_row": None,
+    # "blocker_zone_col": None,
 }
 
 LOGGER = logging.getLogger(__name__)
@@ -58,11 +67,30 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         dictionary_path.with_name(f"{dictionary_path.stem}_processed{dictionary_path.suffix}"),
     )
     LOGGER.info("Using processed dictionary cache at %s", processed_path)
+    # Collect user-provided words
+    user_words: List[str] = list(args.get("words") or [])
+    words_file = args.get("words_file")
+    if words_file is not None:
+        wf_path = Path(words_file)
+        for line in wf_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                user_words.append(line)
+
+    # Build effective theme string (append description when using LLM)
+    use_llm = bool(args.get("llm", False))
+    raw_theme = str(args.get("theme") or "")
+    theme_description = str(args.get("theme_description") or "")
+    if use_llm and theme_description:
+        effective_theme = f"{raw_theme}: {theme_description}"
+    else:
+        effective_theme = raw_theme
+
     config_kwargs: Dict[str, Any] = {
         "height": int(args["height"]),
         "width": int(args["width"]),
         "dictionary_path": dictionary_path,
-        "theme": str(args["theme"]),
+        "theme": effective_theme,
         "seed": int(args["seed"]) if args.get("seed") is not None else None,
         "completion_target": float(args["completion_target"]),
     }
@@ -87,7 +115,22 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         if field in args:
             config_kwargs[field] = caster(args[field])
     config = GeneratorConfig(**config_kwargs)
-    generator = CrosswordGenerator(config)
+
+    # Wire up theme generators
+    theme_gen = None
+    fallbacks = None  # None → default [DummyThemeWordGenerator]
+    if user_words:
+        theme_gen = UserWordListGenerator(user_words)
+        if use_llm:
+            fallbacks = [GeminiThemeWordGenerator(), DummyThemeWordGenerator(seed=config.seed)]
+        else:
+            fallbacks = []
+
+    generator = CrosswordGenerator(
+        config,
+        theme_generator=theme_gen,
+        theme_fallback_generators=fallbacks,
+    )
     grid_seed = generator.rng.randint(0, 1_000_000)
     grid = CrosswordGrid(config.to_grid_config(seed_override=grid_seed))
     return {

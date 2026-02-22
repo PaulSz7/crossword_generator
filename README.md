@@ -11,7 +11,7 @@ words in 5-16 seconds with near 100% success rate.
 - **Fast & reliable**: 5-16 seconds per crossword, 5/5 success rate on 10×15 grids
 - **OR-Tools CP-SAT solver**: Constraint satisfaction with table constraints and uniqueness
 - **Intelligent layout**: Partitions long runs (max 8-10 letters) to target 4-8 letter slots
-- **Theme word placement**: Places 2-5 theme words before layout completion
+- **Three theme generation modes**: theme-only (dummy/LLM), words-only (user list), hybrid (user list + LLM extension)
 - **Blocker zone placement**: Random corner/center placement with optional CLI overrides
 - **TSV-based Romanian dictionary**: Preprocessing with diacritic normalization
 - **Structured JSON output**: Compatible with downstream renderers
@@ -49,6 +49,55 @@ python main.py --height 20 --width 10 --theme "mitologie" \
 Omit the `--blocker-zone-row/col` arguments to keep randomized placement while still
 overriding the rectangle dimensions.
 
+### Theme generation modes
+
+The generator supports three modes for supplying theme words:
+
+**Theme-only** (original behaviour) — dummy word buckets fill the theme pool from predefined lists keyed by theme name:
+
+```bash
+python main.py --height 10 --width 12 --theme mitologie
+```
+
+**Words-only** — an explicit user-supplied list is used as the entire theme pool. No LLM is called and no dummy words are added. The minimum coverage check is skipped (the user is responsible for how many words are provided). User words bypass crossing-slot validation so they are always placed if they fit geometrically:
+
+```bash
+# Inline words (WORD or WORD:Clue)
+python main.py --height 10 --width 12 \
+  --words APOLON ARES 'ATHENA:Zeita intelepciunii'
+
+# From a file (one entry per line, # comments and blank lines ignored)
+python main.py --height 10 --width 12 --words-file my_words.txt
+```
+
+`my_words.txt` format:
+```
+# Lines starting with # are comments
+APOLON:Zeul soarelui
+ARES
+ATHENA:Zeita intelepciunii
+```
+
+**Hybrid** — user-supplied words are placed first (guaranteed), then Gemini extends the pool to reach coverage targets. If no Gemini API key is available the dummy generator acts as a second fallback:
+
+```bash
+python main.py --height 10 --width 12 \
+  --words 'APOLON:Zeul soarelui' ARES \
+  --theme mitologie \
+  --theme-description "Zeii olimpieni din mitologia greaca" \
+  --llm
+```
+
+`--llm` requires `--theme`. `--theme-description` is optional additional context for the LLM prompt.
+
+The fallback chain for each mode:
+
+| Mode | Flags | Fallback chain |
+|------|-------|----------------|
+| Theme-only | `--theme X` | `DummyThemeWordGenerator` |
+| Words-only | `--words ...` | *(none)* |
+| Hybrid | `--words ... --theme X --llm` | `GeminiThemeWordGenerator → DummyThemeWordGenerator` |
+
 ### Dictionary preprocessing cache
 
 Processing the raw `dex_words.tsv` file once yields a compact, deduplicated
@@ -67,11 +116,17 @@ run if missing.
 ```python
 from debug_main import run_debug
 
-# Single run with defaults (10x15, mitologie theme)
+# Theme-only (default DEFAULT_DEBUG_ARGS)
 result = run_debug(max_runs=15)
 
 # Custom size and theme
 result = run_debug(max_runs=15, height=12, width=18, theme="natura")
+
+# Words-only: place exactly these two words, no fallback, no coverage check
+result = run_debug(words=["ZEUS", "THOR"], theme="", max_runs=5)
+
+# Hybrid: user words guaranteed, Gemini extends (dummy fallback if no API key)
+result = run_debug(words=["ZEUS:Regele zeilor", "THOR"], theme="mitologie", llm=True)
 ```
 
 The `run_debug()` helper retries different RNG seeds automatically until it finds
