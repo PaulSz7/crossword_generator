@@ -27,19 +27,20 @@ from crossword.core.exceptions import CrosswordError, ThemeWordError
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig, CrosswordResult
 from crossword.engine.grid import CrosswordGrid
 from crossword.data.preprocess import ensure_processed_dictionary
-from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator
+from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator, ThemeType
 from crossword.io.clues import ClueRequest, attach_clues_to_grid
 from crossword.utils.logger import configure_logging
 from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
 
 DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
-    "height": 10,
-    "width": 8,
-    "theme": "mitologie",
-    "words": ["ZEUS", "THOR"],           # list of "WORD" or "WORD:Clue" strings
+    "height": 15,
+    "width": 12,
+    "theme_title": "Culori De Flori",
+    "theme_type": ThemeType.CUSTOM,
+    "theme_description": "Cuvinte care reprizinta culorile petalelor unor flori",  # creative brief / joke text / extra context
+    "words": ["ROSU:Mac", "ALB:Ghiocel"],           # list of "WORD" or "WORD:Clue" strings
     "words_file": None,    # Path or str to a words file
-    "llm": True,          # extend user words via Gemini (requires theme)
-    "theme_description": "",  # extra context appended to theme for LLM
+    "llm": True,          # extend user words via Gemini (requires theme_title)
     "dictionary_path": Path("local_db/dex_words.tsv"),
     "seed": None,
     "completion_target": 1,
@@ -77,20 +78,25 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
             if line and not line.startswith("#"):
                 user_words.append(line)
 
-    # Build effective theme string (append description when using LLM)
     use_llm = bool(args.get("llm", False))
-    raw_theme = str(args.get("theme") or "")
+    theme_title = str(args.get("theme_title") or "")
+    _theme_type_raw = args.get("theme_type") or "domain_specific_words"
+    # Support both plain strings and ThemeType enum instances in DEFAULT_DEBUG_ARGS
+    theme_type = _theme_type_raw.value if hasattr(_theme_type_raw, "value") else str(_theme_type_raw)
     theme_description = str(args.get("theme_description") or "")
-    if use_llm and theme_description:
-        effective_theme = f"{raw_theme}: {theme_description}"
-    else:
-        effective_theme = raw_theme
+
+    extend_with_substring = (
+        theme_type == "words_containing_substring" and bool(user_words) and use_llm
+    )
 
     config_kwargs: Dict[str, Any] = {
         "height": int(args["height"]),
         "width": int(args["width"]),
         "dictionary_path": dictionary_path,
-        "theme": effective_theme,
+        "theme_title": theme_title,
+        "theme_type": theme_type,
+        "theme_description": theme_description,
+        "extend_with_substring": extend_with_substring,
         "seed": int(args["seed"]) if args.get("seed") is not None else None,
         "completion_target": float(args["completion_target"]),
     }
@@ -111,18 +117,30 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         "blocker_zone_row": int,
         "blocker_zone_col": int,
     }
-    for field, caster in optional_fields.items():
-        if field in args:
-            config_kwargs[field] = caster(args[field])
+    for field_name, caster in optional_fields.items():
+        if field_name in args:
+            config_kwargs[field_name] = caster(args[field_name])
     config = GeneratorConfig(**config_kwargs)
 
-    # Wire up theme generators
+    # Wire up theme generators (same logic as main.py)
     theme_gen = None
     fallbacks = None  # None → default [DummyThemeWordGenerator]
-    if user_words:
+
+    if theme_type == "words_containing_substring":
+        if user_words:
+            theme_gen = UserWordListGenerator(user_words)
+        # theme_gen=None when no user words → SubstringGen becomes primary in _seed_theme_words
+        fallbacks = []  # no LLM/dummy fallbacks; extension controlled by extend_with_substring flag
+    elif user_words:
         theme_gen = UserWordListGenerator(user_words)
         if use_llm:
-            fallbacks = [GeminiThemeWordGenerator(), DummyThemeWordGenerator(seed=config.seed)]
+            fallbacks = [
+                GeminiThemeWordGenerator(
+                    theme_type=theme_type,
+                    theme_description=theme_description,
+                ),
+                DummyThemeWordGenerator(seed=config.seed),
+            ]
         else:
             fallbacks = []
 
@@ -230,12 +248,15 @@ def step_clues(state: Dict[str, Any]):
 def build_result(state: Dict[str, Any]) -> CrosswordResult:
     slots = state["slots"] or list(state["grid"].word_slots.values())
     messages = state["validation"].messages if state["validation"] else []
+    generator: CrosswordGenerator = state["generator"]
     return CrosswordResult(
         grid=state["grid"],
         slots=slots,
         theme_words=state["theme_words"],
         validation_messages=messages,
         seed=state["config"].seed,
+        crossword_title=generator._theme_crossword_title,
+        theme_content=generator._theme_content,
     )
 
 
@@ -351,7 +372,7 @@ def _run_single_attempt(
 def main() -> None:  # pragma: no cover - manual helper
     result = run_debug()
     print(f"Seed: {result.seed}")
-    print(f"Generated {len(result.slots)} slots for theme '{DEFAULT_DEBUG_ARGS['theme']}'")
+    print(f"Generated {len(result.slots)} slots for theme '{DEFAULT_DEBUG_ARGS['theme_title']}'")
     print(f"Validation: {result.validation_messages or 'ok'}")
 
 

@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
+from crossword.data.theme import ThemeType
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig
 from crossword.utils.logger import configure_logging
 
@@ -29,7 +30,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--height", type=int, required=True, help="Grid height in cells")
     parser.add_argument("--width", type=int, required=True, help="Grid width in cells")
-    parser.add_argument("--theme", type=str, default="", help="Theme description")
+    parser.add_argument("--theme-title", type=str, default="", help="Theme title / keyword")
+    parser.add_argument(
+        "--theme-type",
+        type=str,
+        choices=[t.value for t in ThemeType],
+        default="domain_specific_words",
+        help="Theme generation strategy",
+    )
     parser.add_argument(
         "--words",
         nargs="+",
@@ -45,13 +53,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm",
         action="store_true",
-        help="Extend user-provided words with LLM-generated theme words (requires --theme)",
+        help="Extend user-provided words with LLM-generated theme words (requires --theme-title for domain_specific_words)",
     )
     parser.add_argument(
         "--theme-description",
         type=str,
         default="",
-        help="Additional context for the LLM prompt when --llm is used",
+        help="Additional context for the LLM prompt (creative brief for 'custom', joke text for 'joke_continuation')",
     )
     parser.add_argument(
         "--dictionary",
@@ -135,11 +143,21 @@ def main(argv: list[str] | None = None) -> None:
     if args.no_blocker_zone and any(value is not None for value in override_fields):
         parser.error("--no-blocker-zone cannot be combined with blocker zone overrides")
 
+    theme_type = args.theme_type
+    has_user_words = bool(args.words or args.words_file)
+
     # Validate mode flags
-    if args.llm and not args.theme:
-        parser.error("--llm requires --theme")
-    if not args.theme and not args.words and not args.words_file:
-        parser.error("provide at least --theme or --words / --words-file")
+    if args.llm and not args.theme_title and theme_type == "domain_specific_words":
+        parser.error("--llm requires --theme-title for domain_specific_words")
+    if theme_type == "domain_specific_words" and not args.theme_title and not has_user_words:
+        parser.error("provide at least --theme-title or --words / --words-file")
+    if theme_type == "words_containing_substring" and not args.theme_title:
+        parser.error("--theme-type words_containing_substring requires --theme-title")
+    if theme_type == "words_containing_substring" and not has_user_words and not args.llm:
+        parser.error(
+            "--theme-type words_containing_substring without --words requires --llm "
+            "to enable the dictionary substring search"
+        )
 
     # Collect user-provided words
     user_words: List[str] = []
@@ -148,16 +166,18 @@ def main(argv: list[str] | None = None) -> None:
     if args.words_file:
         user_words.extend(parse_words_file(args.words_file))
 
-    # Determine effective theme string
-    theme_str = args.theme
-    if args.llm and args.theme_description:
-        theme_str = f"{args.theme}: {args.theme_description}"
+    extend_with_substring = (
+        theme_type == "words_containing_substring" and bool(user_words) and args.llm
+    )
 
     config = GeneratorConfig(
         height=args.height,
         width=args.width,
         dictionary_path=args.dictionary,
-        theme=theme_str,
+        theme_title=args.theme_title,
+        theme_type=theme_type,
+        theme_description=args.theme_description,
+        extend_with_substring=extend_with_substring,
         seed=args.seed,
         completion_target=args.completion_target,
         min_theme_coverage=args.min_theme_coverage,
@@ -174,13 +194,58 @@ def main(argv: list[str] | None = None) -> None:
     theme_gen = None
     fallbacks = None  # None → CrosswordGenerator will use default [DummyThemeWordGenerator]
 
-    if user_words:
-        from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator
-        theme_gen = UserWordListGenerator(user_words)
-        if args.llm:
-            fallbacks = [GeminiThemeWordGenerator(), DummyThemeWordGenerator(seed=config.seed)]
-        else:
+    from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator
+
+    if theme_type == "words_containing_substring":
+        # SubstringThemeWordGenerator is always wired inside _seed_theme_words.
+        # extend_with_substring (set above) tells it whether to extend user words from the dictionary.
+        if user_words:
+            theme_gen = UserWordListGenerator(user_words)
+        # theme_gen=None when no user words → SubstringGen becomes primary in _seed_theme_words
+        fallbacks = []  # no LLM/dummy fallbacks for this type
+
+    elif theme_type == "joke_continuation":
+        if user_words and not args.llm:
+            theme_gen = UserWordListGenerator(user_words)
             fallbacks = []
+        elif user_words and args.llm:
+            theme_gen = UserWordListGenerator(user_words)
+            fallbacks = [
+                GeminiThemeWordGenerator(
+                    theme_type=theme_type,
+                    theme_description=args.theme_description,
+                ),
+                DummyThemeWordGenerator(seed=config.seed),
+            ]
+        else:
+            theme_gen = GeminiThemeWordGenerator(
+                theme_type=theme_type,
+                theme_description=args.theme_description,
+            )
+            fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
+
+    elif theme_type == "custom":
+        theme_gen = GeminiThemeWordGenerator(
+            theme_type=theme_type,
+            theme_description=args.theme_description,
+        )
+        fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
+
+    else:
+        # domain_specific_words (default)
+        if user_words:
+            theme_gen = UserWordListGenerator(user_words)
+            if args.llm:
+                fallbacks = [
+                    GeminiThemeWordGenerator(
+                        theme_type=theme_type,
+                        theme_description=args.theme_description,
+                    ),
+                    DummyThemeWordGenerator(seed=config.seed),
+                ]
+            else:
+                fallbacks = []
+        # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
 
     generator = CrosswordGenerator(
         config,
@@ -190,6 +255,8 @@ def main(argv: list[str] | None = None) -> None:
     result = generator.generate()
 
     payload: Dict[str, Any] = {
+        "crossword_title": result.crossword_title,
+        "theme_content": result.theme_content,
         "grid": result.grid.to_jsonable(),
         "theme_words": [tw.__dict__ for tw in result.theme_words],
         "slots": [

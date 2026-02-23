@@ -50,7 +50,7 @@ class GridClueTests(unittest.TestCase):
         config = GeneratorConfig(
             height=6, width=6,
             dictionary_path=Path("local_db/dex_words.tsv"),
-            theme="test",
+            theme_title="test",
         )
         generator = CrosswordGenerator(config, dictionary=fake_dictionary)
 
@@ -74,7 +74,7 @@ class GridClueTests(unittest.TestCase):
         config = GeneratorConfig(
             height=5, width=5,
             dictionary_path=Path("local_db/dex_words.tsv"),
-            theme="test",
+            theme_title="test",
         )
         generator = CrosswordGenerator(config, dictionary=fake_dictionary)
 
@@ -139,7 +139,7 @@ class GridClueTests(unittest.TestCase):
             height=12,
             width=10,
             dictionary_path=Path("local_db/dex_words.tsv"),
-            theme="demo",
+            theme_title="demo",
             blocker_zone_height=4,
             blocker_zone_width=6,
         )

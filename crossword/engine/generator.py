@@ -22,7 +22,10 @@ from ..core.exceptions import (ClueBoxError, CrosswordError, SlotPlacementError,
 from .grid import CrosswordGrid, GridConfig
 from ..utils.logger import get_logger
 from ..core.models import Clue, WordSlot
-from ..data.theme import DummyThemeWordGenerator, ThemeWord, ThemeWordGenerator, merge_theme_generators
+from ..data.theme import (
+    DummyThemeWordGenerator, SubstringThemeWordGenerator,
+    ThemeOutput, ThemeType, ThemeWord, ThemeWordGenerator, merge_theme_generators,
+)
 from .validator import GridValidator
 
 
@@ -34,7 +37,10 @@ class GeneratorConfig:
     height: int
     width: int
     dictionary_path: Path | str
-    theme: str = ""
+    theme_title: str = ""
+    theme_type: str = "domain_specific_words"
+    theme_description: str = ""
+    extend_with_substring: bool = False  # words_containing_substring: extend user words from dictionary
     seed: Optional[int] = None
     completion_target: float = 0.85
     max_iterations: int = 2500
@@ -102,6 +108,8 @@ class CrosswordResult:
     theme_words: List[ThemeWord]
     validation_messages: List[str] = field(default_factory=list)
     seed: Optional[int] = None
+    crossword_title: Optional[str] = None
+    theme_content: Optional[str] = None
 
 
 @dataclass
@@ -141,6 +149,8 @@ class CrosswordGenerator:
         self.used_words: Set[str] = set()
         self.remaining_theme_words: Set[str] = set()
         self.theme_word_surfaces: Set[str] = set()
+        self._theme_crossword_title: Optional[str] = None
+        self._theme_content: Optional[str] = None
         self._slot_counter = 0
         self._occupied_slots: Set[str] = set()
         self._slot_keys: Dict[str, str] = {}
@@ -197,6 +207,8 @@ class CrosswordGenerator:
                     theme_words=theme_words,
                     validation_messages=validation.messages,
                     seed=self.config.seed,
+                    crossword_title=self._theme_crossword_title,
+                    theme_content=self._theme_content,
                 )
             except CrosswordError as exc:
                 LOGGER.warning("Generation attempt failed: %s", exc)
@@ -208,7 +220,7 @@ class CrosswordGenerator:
     # Theme seeding
     # ------------------------------------------------------------------
     def _seed_theme_words(self, grid: CrosswordGrid) -> List[ThemeWord]:
-        LOGGER.info("Preparing theme words for '%s'", self.config.theme)
+        LOGGER.info("Preparing theme words for '%s'", self.config.theme_title)
 
         playable_cells = grid._playable_count
         min_theme_letters = max(1, int(playable_cells * self.config.min_theme_coverage))
@@ -218,10 +230,38 @@ class CrosswordGenerator:
         estimated_words_needed = (min_theme_letters // 5) + 2
         target = max(self.config.theme_request_size, estimated_words_needed * 3)
 
-        theme_words = merge_theme_generators(
-            self.theme_generator, self.theme_fallback_generators, self.config.theme, target,
+        primary = self.theme_generator
+        fallbacks = list(self.theme_fallback_generators)
+        if self.config.theme_type in (ThemeType.WORDS_CONTAINING_SUBSTRING, "words_containing_substring"):
+            substring_gen = SubstringThemeWordGenerator(self.dictionary, self.config.theme_title)
+            if primary is None:
+                # llm=True, no user words: dictionary is the sole source
+                primary = substring_gen
+                fallbacks = []
+            elif self.config.extend_with_substring:
+                # llm=True, user words provided: user words first, dictionary extends
+                fallbacks = [substring_gen]
+            else:
+                # llm=False, user words provided: user words only
+                fallbacks = []
+
+        theme_output: ThemeOutput = merge_theme_generators(
+            primary, fallbacks, self.config.theme_title, target,
             difficulty=self.config.difficulty, language=self.config.language,
         )
+        # Capture metadata from LLM for downstream use
+        self._theme_crossword_title = theme_output.crossword_title
+        self._theme_content = theme_output.content
+
+        # For joke_continuation with user words + description but no LLM: use description as content
+        if (
+            self.config.theme_type in (ThemeType.JOKE_CONTINUATION, "joke_continuation")
+            and self._theme_content is None
+            and self.config.theme_description
+        ):
+            self._theme_content = self.config.theme_description
+
+        theme_words = theme_output.words
         if not theme_words:
             raise ThemeWordError("No theme words available")
 
@@ -958,6 +998,8 @@ class CrosswordGenerator:
         self.used_words.clear()
         self.remaining_theme_words.clear()
         self.theme_word_surfaces.clear()
+        self._theme_crossword_title = None
+        self._theme_content = None
         self._occupied_slots.clear()
         self._slot_keys.clear()
         self._slot_counter = 0
