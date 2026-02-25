@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from crossword.data.theme import ThemeType
+from crossword.data.theme_cache import ThemeCache
+from crossword.engine.crossword_store import CrosswordStore
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig
 from crossword.utils.logger import configure_logging
 
@@ -190,6 +192,10 @@ def main(argv: list[str] | None = None) -> None:
         blocker_zone_col=args.blocker_zone_col,
     )
 
+    # Initialise persistent stores
+    theme_cache = ThemeCache()
+    crossword_store = CrosswordStore()
+
     # Wire up generators based on mode
     theme_gen = None
     fallbacks = None  # None → CrosswordGenerator will use default [DummyThemeWordGenerator]
@@ -214,6 +220,7 @@ def main(argv: list[str] | None = None) -> None:
                 GeminiThemeWordGenerator(
                     theme_type=theme_type,
                     theme_description=args.theme_description,
+                    cache=theme_cache,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
@@ -221,6 +228,7 @@ def main(argv: list[str] | None = None) -> None:
             theme_gen = GeminiThemeWordGenerator(
                 theme_type=theme_type,
                 theme_description=args.theme_description,
+                cache=theme_cache,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -228,6 +236,7 @@ def main(argv: list[str] | None = None) -> None:
         theme_gen = GeminiThemeWordGenerator(
             theme_type=theme_type,
             theme_description=args.theme_description,
+            cache=theme_cache,
         )
         fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -240,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
                     GeminiThemeWordGenerator(
                         theme_type=theme_type,
                         theme_description=args.theme_description,
+                        cache=theme_cache,
                     ),
                     DummyThemeWordGenerator(seed=config.seed),
                 ]
@@ -251,6 +261,8 @@ def main(argv: list[str] | None = None) -> None:
         config,
         theme_generator=theme_gen,
         theme_fallback_generators=fallbacks,
+        store=crossword_store,
+        theme_cache=theme_cache,
     )
     result = generator.generate()
 

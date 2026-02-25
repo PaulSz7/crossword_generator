@@ -10,10 +10,12 @@ from enum import Enum
 from typing import TYPE_CHECKING, Iterable, List, Optional, Protocol, Sequence
 
 from ..core.constants import Difficulty
+from ..io.gemini_client import GeminiClient
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
     from .dictionary import WordDictionary
+    from .theme_cache import ThemeCache
 
 
 LOGGER = get_logger(__name__)
@@ -59,21 +61,28 @@ class GeminiThemeWordGenerator:
 
     def __init__(
         self,
-        model_name: str = "gemini-pro",
-        api_key_env: str = "GOOGLE_API_KEY",
+        model_name: str = "gemini-2.5-flash",
+        api_key_env: str = "GEMINI_API_KEY",
+        model_env: str = "GEMINI_MODEL",
         theme_type: str = "domain_specific_words",
         theme_description: str = "",
+        cache: Optional["ThemeCache"] = None,
+        gemini_client: Optional[GeminiClient] = None,
     ) -> None:
-        self.model_name = model_name
+        resolved_model = os.environ.get(model_env, model_name)
+        self.model_name = resolved_model
         self.api_key_env = api_key_env
+        self.model_env = model_env
         self.theme_type = theme_type
         self.theme_description = theme_description
+        self.cache = cache
+        self._client = gemini_client
 
     THEME_BASE_PROMPT = (
-        "You are assisting with a {language} cryptic crossword. "
+        "You are assisting with a {language} clue in the grid cryptic crossword. "
         "Generate between 50 and {limit} JSON lines describing unique theme words. "
         "Theme: '{theme}'. Each JSON line must contain fields: word, clue. "
-        "The clue must be 3-5 words in {language}, cryptic-friendly. "
+        "The clue must be very short, 1-4 words if possible, in {language}, cryptic-friendly. "
         "Output no more than {limit} entries."
     )
 
@@ -83,7 +92,7 @@ class GeminiThemeWordGenerator:
         "{description_line}"
         "Return a SINGLE JSON object (not JSON lines) with:\n"
         '  "joke_text": the complete short joke (setup + punchline, 1-3 sentences),\n'
-        '  "words": [ {{"word": "UPPERCASE_WORD", "clue": "3-5 word {language} cryptic clue"}}, ...]\n'
+        '  "words": [ {{"word": "UPPERCASE_WORD", "clue": "1-4 word {language} cryptic clue"}}, ...]\n'
         "Generate between 20 and {limit} unique {language} words.\n"
     )
 
@@ -118,20 +127,37 @@ class GeminiThemeWordGenerator:
         self, theme: str, limit: int = 80,
         difficulty: str = "MEDIUM", language: str = "Romanian",
     ) -> ThemeOutput:  # pragma: no cover - external
-        api_key = os.environ.get(self.api_key_env)
-        if not api_key:
-            raise RuntimeError(
-                f"Missing Gemini API key in environment variable {self.api_key_env}"
+        normalized_type = (
+            self.theme_type.value
+            if isinstance(self.theme_type, ThemeType) else str(self.theme_type)
+        )
+        if self.cache is not None:
+            cached = self.cache.lookup(
+                theme, difficulty, language,
+                theme_description=self.theme_description,
+                theme_type=normalized_type,
             )
-        try:
-            import google.generativeai as genai  # type: ignore
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("google-generativeai package required for Gemini integration") from exc
+            if cached is not None:
+                return cached
 
-        genai.configure(api_key=api_key)
         prompt = self._render_prompt(theme, limit, difficulty, language)
-        response = genai.GenerativeModel(self.model_name).generate_content(prompt)
-        return self._parse_response(response.text, self.theme_type)
+        client = self._client or GeminiClient(
+            model_name=self.model_name,
+            api_key_env=self.api_key_env,
+            model_env=self.model_env,
+        )
+        self._client = client
+        response_text = client.generate_text(prompt)
+        theme_output = self._parse_response(response_text, self.theme_type)
+
+        # Persist result
+        if self.cache is not None:
+            self.cache.save(
+                theme, self.theme_type, difficulty, language,
+                theme_output, theme_description=self.theme_description,
+            )
+
+        return theme_output
 
     def _render_prompt(self, theme: str, limit: int,
                        difficulty: str = "MEDIUM", language: str = "Romanian") -> str:

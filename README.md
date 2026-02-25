@@ -26,7 +26,7 @@ local_db/dex_words.tsv
 ```
 
 ```bash
-python main.py --height 10 --width 15 --theme "mitologie" \
+python main.py --height 10 --width 15 --theme-title "mitologie" \
   --dictionary local_db/dex_words.tsv --seed 42 --completion-target 1.0
 ```
 
@@ -39,10 +39,10 @@ You can disable blocker zone placement entirely or force a custom rectangle via 
 
 ```bash
 # Disable the blocker zone
-python main.py --height 10 --width 15 --theme "mitologie" --no-blocker-zone
+python main.py --height 10 --width 15 --theme-title "mitologie" --no-blocker-zone
 
 # Force a 5×10 top strip blocker zone (rows 0-4, cols 0-9)
-python main.py --height 20 --width 10 --theme "mitologie" \
+python main.py --height 20 --width 10 --theme-title "mitologie" \
   --blocker-zone-height 5 --blocker-zone-width 10 --blocker-zone-row 0 --blocker-zone-col 0
 ```
 
@@ -56,7 +56,7 @@ The generator supports three modes for supplying theme words:
 **Theme-only** (original behaviour) — dummy word buckets fill the theme pool from predefined lists keyed by theme name:
 
 ```bash
-python main.py --height 10 --width 12 --theme mitologie
+python main.py --height 10 --width 12 --theme-title mitologie
 ```
 
 **Words-only** — an explicit user-supplied list is used as the entire theme pool. No LLM is called and no dummy words are added. The minimum coverage check is skipped (the user is responsible for how many words are provided). User words bypass crossing-slot validation so they are always placed if they fit geometrically:
@@ -83,12 +83,21 @@ ATHENA:Zeita intelepciunii
 ```bash
 python main.py --height 10 --width 12 \
   --words 'APOLON:Zeul soarelui' ARES \
-  --theme mitologie \
+  --theme-title mitologie \
   --theme-description "Zeii olimpieni din mitologia greaca" \
   --llm
 ```
 
-`--llm` requires `--theme`. `--theme-description` is optional additional context for the LLM prompt.
+`--llm` requires `--theme-title`. `--theme-description` is optional additional context for the LLM prompt.
+
+Gemini integration expects an API key and optional model override exposed via environment variables before running
+the generator:
+
+```bash
+export GEMINI_API_KEY="sk-your-key"
+export GEMINI_MODEL="gemini-2.5-flash"  # optional
+python main.py --height 10 --width 12 --theme-title mitologie --llm
+```
 
 The fallback chain for each mode:
 
@@ -110,6 +119,96 @@ python -m crossword.data.preprocess --source local_db/dex_words.tsv
 The command writes `local_db/dex_words_processed.tsv` containing one row per normalized
 entry (diacritics removed). `WordDictionary` auto-generates this cache on first
 run if missing.
+
+Whenever `dex_query.sql` changes or a fresh DB export is needed, regenerate both files:
+
+```bash
+mysql -u root dexonline --default-character-set=utf8mb4 --batch < local_db/dex_query.sql \
+  > local_db/dex_words.tsv
+rm -f local_db/dex_words_processed.tsv
+python -m crossword.data.preprocess --source local_db/dex_words.tsv
+```
+
+### Word difficulty scoring
+
+Every preprocessed entry carries a `difficulty_score` in [0, 1] (higher = harder).
+The score drives EASY/MEDIUM/HARD mode: in EASY mode the CP-SAT solver only considers
+fill words with `difficulty_score < 0.30`.
+
+**Score formula** (`compute_difficulty_score` in `crossword/data/preprocess.py`):
+
+```
+base = 0.40 × (1 − frequency)
+     + 0.20 × length_score          # normalised word length 3–12
+     + 0.15 × tag_score             # from linguistic register tags
+     + 0.10 × source_score          # from dictionary source rarity
+     + 0.05 × (1 − source_count)    # fewer sources → harder
+     + 0.05 × (1 − definition_count)
+score = max(base, floor)
+```
+
+**Hard floors** guarantee a minimum tier regardless of base score.
+The medium floors (0.30) are **bypassed when `frequency ≥ 0.75`** — very
+common words are allowed into EASY even if their source or tag would otherwise
+push them to MEDIUM:
+
+| Trigger | Floor | Tier | Freq bypass |
+|---------|-------|------|-------------|
+| Hard tag (`rar`, `regional`, `argou`, …) | 0.60 | HARD | no |
+| Hard-source dictionary (DAR, DRAM, Argou, DLRLV) | 0.60 | HARD | no |
+| Medium/foreign tag (`livresc`, `popular`, loanword markers) | 0.30 | MEDIUM | yes (≥ 0.75) |
+| Rare-source dictionary (Scriban, CADE, DTM, …) | 0.35 | MEDIUM | no |
+| Other source (truncated definitions — DEX '09, MDA2, DOOM, …) | 0.30 | MEDIUM | yes (≥ 0.75) |
+
+**Source classification** (`_source_rarity_score`):
+
+Only DEX '96 and DEX '98 have `canDistribute=1` in the database, meaning their
+`Definition.internalRep` is complete in the public SQL dump. All other sources
+have truncated stubs and cannot reliably confirm a word's register, so they
+receive a medium floor at minimum (unless bypassed by high frequency).
+
+| Score | Floor | Category | Examples |
+|-------|-------|----------|---------|
+| 0.0 | none | Known-complete | DEX '96, DEX '98 |
+| 0.5 | 0.30 | Other (truncated defs) | DEX '09, MDA2, DOOM 3, DLRLC, NODEX, … |
+| 1.0 | 0.35 | Rare | Scriban, CADE, DTM, DGS, DER |
+| 2.0 | 0.60 | Hard | DAR, DRAM, DRAM 2015, DRAM 2021, Argou, DLRLV |
+
+**`_best_source` and the `all_sources` SQL column**
+
+A word can appear in multiple dictionaries (e.g. "alb" appears in both
+`DEX '98` and `Argou`). The SQL query's `entry_counts` CTE uses
+`GROUP_CONCAT(DISTINCT s.shortName … SEPARATOR '|')` to expose *all* source
+names for each entry, mirroring how `entry_tags` aggregates tags.
+
+`_best_source(all_sources_str)` then picks the **least-rare** source
+(minimum `_source_rarity_score`) so a common word like "alb" is classified
+by `DEX '98` (score 0.0) rather than `Argou` (score 2.0), while a word that
+appears exclusively in `Argou` correctly receives the hard floor.
+
+**Tag signals** come from three sources, all merged into the `tags` field:
+
+1. **ObjectTag entries** (`entry_tags` CTE) — curated editor tags at entry,
+   lexeme, and definition level; captured across all definitions regardless of rank.
+2. **`#abbrev#` markers** in `internalRep` — expanded via `distinct_abbreviations.csv`
+   into full register phrases (e.g. `#sl.#` → `"limba slavonă; slavon"`). Only
+   extracted from DEX '96/'98 rows (other sources have truncated stubs).
+3. **Inline parenthetical markers** — plain-text register labels such as `(Rar)`,
+   `(Regional)`, `(Familiar)` embedded in the definition text. Extracted by
+   `_extract_paren_tags` and kept only when they match the known tag vocabulary.
+   Only applied to DEX '96/'98 rows.
+
+**Tag matching** uses word-boundary checking for single-word patterns (so
+`"rar"` does not trigger on `"glife rare"`), and simple substring matching for
+prefix patterns in `_FOREIGN_LANG_TAGS` (e.g. `"angl"` catches `"anglicism"`).
+
+**Current distribution** across 282,895 words:
+
+| Tier | Range | Count | % | Key length counts |
+|------|-------|-------|---|-------------------|
+| EASY | < 0.30 | ~90K | 31.7% | 4-letter: 2,090 / 5-letter: 5,708 / 8-letter: 18,590 |
+| MEDIUM | 0.30–0.60 | ~137K | 48.4% | — |
+| HARD | ≥ 0.60 | ~56K | 19.9% | — |
 
 ### Fast debug runs
 
@@ -189,7 +288,7 @@ Run tests:
 poetry run pytest
 ```
 
-All 9 tests should pass.
+All 61 tests should pass.
 
 ## How It Works
 

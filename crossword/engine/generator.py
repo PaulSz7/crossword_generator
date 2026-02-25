@@ -24,8 +24,11 @@ from ..utils.logger import get_logger
 from ..core.models import Clue, WordSlot
 from ..data.theme import (
     DummyThemeWordGenerator, SubstringThemeWordGenerator,
-    ThemeOutput, ThemeType, ThemeWord, ThemeWordGenerator, merge_theme_generators,
+    ThemeOutput, ThemeType, ThemeWord, ThemeWordGenerator, UserWordListGenerator,
+    merge_theme_generators,
 )
+from .crossword_store import CrosswordStore
+from ..data.theme_cache import ThemeCache
 from .validator import GridValidator
 
 
@@ -134,6 +137,8 @@ class CrosswordGenerator:
         theme_generator: Optional[ThemeWordGenerator] = None,
         clue_generator: Optional[ClueGenerator] = None,
         theme_fallback_generators: Optional[List[ThemeWordGenerator]] = None,
+        store: Optional[CrosswordStore] = None,
+        theme_cache: Optional[ThemeCache] = None,
     ) -> None:
         self.config = config
         self.rng = random.Random(config.seed)
@@ -146,6 +151,8 @@ class CrosswordGenerator:
         )
         self.clue_generator = clue_generator or TemplateClueGenerator()
         self.validator = GridValidator(self.dictionary)
+        self.store = store
+        self.theme_cache = theme_cache
         self.used_words: Set[str] = set()
         self.remaining_theme_words: Set[str] = set()
         self.theme_word_surfaces: Set[str] = set()
@@ -158,63 +165,89 @@ class CrosswordGenerator:
         self.pending_starts: List[Tuple[float, int, Tuple[int, int, Direction]]] = []
         self._pending_counter = 0
         self._layout_rng = random.Random(config.seed)
+        # Persist last-known state across retries (not cleared by _reset_state)
+        self._last_known_theme_words: Optional[List[ThemeWord]] = None
+        self._last_known_grid: Optional[CrosswordGrid] = None
+        self._theme_cache_ref: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Public entrypoint
     # ------------------------------------------------------------------
     # For EASY difficulty: number of full layout+theme retries using phase-1-only
     # (easy words exclusively) before allowing medium fallback in phase 2.
-    _EASY_PHASE1_RETRIES = 3
+    # Must be < retry_limit for phase 2 to ever activate in generate().
+    _EASY_PHASE1_RETRIES = 1
 
     def generate(self) -> CrosswordResult:
-        for attempt in range(1, self.config.retry_limit + 1):
-            LOGGER.info("Generation attempt %s/%s", attempt, self.config.retry_limit)
-            allow_phase2 = (
-                self.config.difficulty != "EASY"
-                or attempt > self._EASY_PHASE1_RETRIES
-            )
-            try:
-                grid_seed = self.rng.randint(0, 1_000_000)
-                grid = CrosswordGrid(self.config.to_grid_config(seed_override=grid_seed))
-                self._anneal_layout(grid)
-                theme_words = self._seed_theme_words(grid)
-                self._complete_layout(grid)
-                self._cpsat_fill(grid, allow_phase2=allow_phase2)
-                theme_word_surfaces = self.theme_word_surfaces.copy()
-                validation = self.validator.validate(grid, theme_word_surfaces)
-                if not validation.ok:
-                    raise ValidationError(
-                        f"Grid validation failed: {validation.messages}"
-                    )
-                slots = list(grid.word_slots.values())
-                clue_requests = [
-                    ClueRequest(
-                        slot_id=slot.id,
-                        word=slot.text or "",
-                        direction=slot.direction.value,
-                        clue_box=slot.clue_box,
-                    )
-                    for slot in slots
-                ]
-                clue_texts = self.clue_generator.generate(
-                    clue_requests, difficulty=self.config.difficulty, language=self.config.language,
+        try:
+            for attempt in range(1, self.config.retry_limit + 1):
+                LOGGER.info("Generation attempt %s/%s", attempt, self.config.retry_limit)
+                allow_phase2 = (
+                    self.config.difficulty != "EASY"
+                    or attempt > self._EASY_PHASE1_RETRIES
                 )
-                attach_clues_to_grid(grid, slots, clue_texts)
-                LOGGER.info("Crossword generation completed with %s words", len(slots))
-                return CrosswordResult(
-                    grid=grid,
-                    slots=slots,
-                    theme_words=theme_words,
-                    validation_messages=validation.messages,
-                    seed=self.config.seed,
+                try:
+                    grid_seed = self.rng.randint(0, 1_000_000)
+                    grid = CrosswordGrid(self.config.to_grid_config(seed_override=grid_seed))
+                    self._last_known_grid = grid
+                    self._anneal_layout(grid)
+                    theme_words = self._seed_theme_words(grid)
+                    self._complete_layout(grid)
+                    self._cpsat_fill(grid, allow_phase2=allow_phase2)
+                    theme_word_surfaces = self.theme_word_surfaces.copy()
+                    validation = self.validator.validate(grid, theme_word_surfaces)
+                    if not validation.ok:
+                        raise ValidationError(
+                            f"Grid validation failed: {validation.messages}"
+                        )
+                    slots = list(grid.word_slots.values())
+                    clue_requests = [
+                        ClueRequest(
+                            slot_id=slot.id,
+                            word=slot.text or "",
+                            direction=slot.direction.value,
+                            clue_box=slot.clue_box,
+                        )
+                        for slot in slots
+                    ]
+                    clue_texts = self.clue_generator.generate(
+                        clue_requests, difficulty=self.config.difficulty, language=self.config.language,
+                    )
+                    attach_clues_to_grid(grid, slots, clue_texts)
+                    LOGGER.info("Crossword generation completed with %s words", len(slots))
+                    result = CrosswordResult(
+                        grid=grid,
+                        slots=slots,
+                        theme_words=theme_words,
+                        validation_messages=validation.messages,
+                        seed=grid_seed,
+                        crossword_title=self._theme_crossword_title,
+                        theme_content=self._theme_content,
+                    )
+                    if self.store:
+                        self.store.save_success(
+                            result, self.config,
+                            dictionary=self.dictionary,
+                            theme_cache_ref=self._theme_cache_ref,
+                        )
+                    return result
+                except CrosswordError as exc:
+                    LOGGER.warning("Generation attempt failed: %s", exc)
+                    self._reset_state()
+                    continue
+            raise CrosswordError("Unable to generate crossword after retries")
+        except CrosswordError as final_exc:
+            if self.store:
+                self.store.save_failure(
+                    self.config, str(final_exc),
+                    grid=self._last_known_grid,
+                    theme_words=self._last_known_theme_words,
                     crossword_title=self._theme_crossword_title,
                     theme_content=self._theme_content,
+                    dictionary=self.dictionary,
+                    theme_cache_ref=self._theme_cache_ref,
                 )
-            except CrosswordError as exc:
-                LOGGER.warning("Generation attempt failed: %s", exc)
-                self._reset_state()
-                continue
-        raise CrosswordError("Unable to generate crossword after retries")
+            raise
 
     # ------------------------------------------------------------------
     # Theme seeding
@@ -252,6 +285,14 @@ class CrosswordGenerator:
         # Capture metadata from LLM for downstream use
         self._theme_crossword_title = theme_output.crossword_title
         self._theme_content = theme_output.content
+        if self.theme_cache is not None:
+            self._theme_cache_ref = self.theme_cache.cache_id(
+                theme_title=self.config.theme_title,
+                difficulty=self.config.difficulty,
+                language=self.config.language,
+                theme_description=self.config.theme_description,
+                theme_type=self.config.theme_type,
+            )
 
         # For joke_continuation with user words + description but no LLM: use description as content
         if (
@@ -288,7 +329,10 @@ class CrosswordGenerator:
             placed.append(theme_entry)
             letters_used += len(cleaned)
 
-        if letters_used < min_theme_letters and self.theme_fallback_generators:
+        # Skip coverage enforcement when the user explicitly provided words
+        # (LLM / Dummy fallbacks are supplemental — if they fail, proceed with user words)
+        has_user_primary = isinstance(self.theme_generator, UserWordListGenerator)
+        if letters_used < min_theme_letters and self.theme_fallback_generators and not has_user_primary:
             raise ThemeWordError(
                 f"Insufficient theme coverage: {letters_used}/{min_theme_letters} letters "
                 f"({letters_used / playable_cells * 100:.0f}% vs "
@@ -299,6 +343,8 @@ class CrosswordGenerator:
                 "Words-only mode: skipping coverage check (%d/%d letters placed)",
                 letters_used, min_theme_letters,
             )
+
+        self._last_known_theme_words = placed
 
         self.remaining_theme_words = {
             self.dictionary.sanitize(entry.word) for entry in theme_words if entry not in placed
@@ -319,8 +365,11 @@ class CrosswordGenerator:
         is_theme: bool = False,
         skip_crossing_validation: bool = False,
     ) -> bool:
-        if self._attempt_pending_start(grid, word, theme_entry, is_theme, skip_crossing_validation):
-            return True
+        # Pending starts chain words together — useful for fill but counter-productive
+        # for theme seeding where words should be spread across the grid.
+        if not is_theme:
+            if self._attempt_pending_start(grid, word, theme_entry, is_theme, skip_crossing_validation):
+                return True
 
         for _ in range(self.config.theme_placement_attempts):
             direction = self.rng.choice([Direction.ACROSS, Direction.DOWN])
@@ -635,15 +684,15 @@ class CrosswordGenerator:
         _SOLVER_CANDIDATES = {"EASY": 2000, "MEDIUM": 8000, "HARD": 1500}
 
         max_cands = _SOLVER_CANDIDATES.get(self.config.difficulty, 8000)
-        timeout = min(30.0, self.config.fill_timeout_seconds)
+        timeout = self.config.fill_timeout_seconds
 
         # EASY: two-phase fill.
         # Phase 1 (easy-only): hard DS ceiling guarantees no medium words slip in.
         # Phase 2 (limited medium): only reached after _EASY_PHASE1_RETRIES full
         # layout+theme attempts have all failed phase 1. Medium words are allowed
-        # only for slots that have zero easy candidates, capped at ~10% of slots.
+        # only for slots that have zero easy candidates, capped at ~25% of slots.
         if self.config.difficulty == "EASY":
-            phase1_timeout = timeout if not allow_phase2 else timeout * 0.7
+            phase1_timeout = timeout if not allow_phase2 else timeout * 0.6
             result = solve_crossword(
                 grid, licensable, self.dictionary,
                 used_words=self.used_words,
@@ -656,8 +705,8 @@ class CrosswordGenerator:
             )
             if result is None and allow_phase2:
                 # Each relaxed slot contributes at most 1 medium word.
-                # Dynamic cap: ~10% of fill slots, floor of 2.
-                medium_limit = max(2, len(licensable) // 10)
+                # Dynamic cap: ~25% of fill slots, floor of 5.
+                medium_limit = max(5, len(licensable) // 4)
                 LOGGER.info(
                     "EASY phase 1 failed; retrying with medium fallback for up to %d slot(s)",
                     medium_limit,
@@ -666,7 +715,7 @@ class CrosswordGenerator:
                     grid, licensable, self.dictionary,
                     used_words=self.used_words,
                     theme_surfaces=self.theme_word_surfaces,
-                    timeout=timeout * 0.3,
+                    timeout=timeout * 0.4,
                     max_candidates=max_cands,
                     fallback_fraction=0.0,
                     max_difficulty_score=0.3,
@@ -1000,6 +1049,7 @@ class CrosswordGenerator:
         self.theme_word_surfaces.clear()
         self._theme_crossword_title = None
         self._theme_content = None
+        self._theme_cache_ref = None
         self._occupied_slots.clear()
         self._slot_keys.clear()
         self._slot_counter = 0

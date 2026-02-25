@@ -20,17 +20,22 @@ import logging
 import time
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 
 from crossword.core.exceptions import CrosswordError, ThemeWordError
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig, CrosswordResult
 from crossword.engine.grid import CrosswordGrid
+from crossword.engine.crossword_store import CrosswordStore
 from crossword.data.preprocess import ensure_processed_dictionary
 from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator, ThemeType
+from crossword.data.theme_cache import ThemeCache
 from crossword.io.clues import ClueRequest, attach_clues_to_grid
 from crossword.utils.logger import configure_logging
 from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
+
+load_dotenv()
 
 DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "height": 15,
@@ -47,7 +52,7 @@ DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "max_iterations": 8000,
     "fill_timeout_seconds": 75.0,
     "difficulty": "EASY",
-    "place_blocker_zone": False,
+    "place_blocker_zone": True,
     # "blocker_zone_height": None,
     # "blocker_zone_width": None,
     # "blocker_zone_row": None,
@@ -122,6 +127,10 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
             config_kwargs[field_name] = caster(args[field_name])
     config = GeneratorConfig(**config_kwargs)
 
+    # Initialise persistent stores
+    theme_cache = ThemeCache()
+    crossword_store = CrosswordStore()
+
     # Wire up theme generators (same logic as main.py)
     theme_gen = None
     fallbacks = None  # None → default [DummyThemeWordGenerator]
@@ -138,6 +147,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
                 GeminiThemeWordGenerator(
                     theme_type=theme_type,
                     theme_description=theme_description,
+                    cache=theme_cache,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
@@ -148,13 +158,17 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         config,
         theme_generator=theme_gen,
         theme_fallback_generators=fallbacks,
+        store=crossword_store,
+        theme_cache=theme_cache,
     )
     grid_seed = generator.rng.randint(0, 1_000_000)
     grid = CrosswordGrid(config.to_grid_config(seed_override=grid_seed))
     return {
         "config": config,
         "generator": generator,
+        "store": crossword_store,
         "grid": grid,
+        "grid_seed": grid_seed,
         "theme_words": [],
         "validation": None,
         "slots": [],
@@ -254,14 +268,18 @@ def build_result(state: Dict[str, Any]) -> CrosswordResult:
         slots=slots,
         theme_words=state["theme_words"],
         validation_messages=messages,
-        seed=state["config"].seed,
+        seed=state.get("grid_seed"),
         crossword_title=generator._theme_crossword_title,
         theme_content=generator._theme_content,
     )
 
 
 def run_debug(**overrides: Any) -> CrosswordResult:
-    """Execute the pipeline with automatic retries for a valid grid."""
+    """Execute the pipeline with automatic retries for a valid grid.
+
+    Saves exactly one document to CrosswordStore per call — either the
+    successful result or a failure record after all attempts are exhausted.
+    """
 
     max_runs = int(overrides.pop("max_runs", 15))
     theme_retries = int(overrides.pop("theme_retries", 5))
@@ -277,6 +295,34 @@ def run_debug(**overrides: Any) -> CrosswordResult:
     base_overrides.pop("seed", None)
     base_overrides.pop("max_iterations", None)
     base_overrides.pop("fill_timeout_seconds", None)
+
+    # One store for the entire job — saved once at the end.
+    store = CrosswordStore()
+    # Captures state from the last failed attempt for the failure document.
+    last_failure_state: Dict[str, Any] = {}
+
+    def _save_success(result: CrosswordResult, state: Dict[str, Any]) -> None:
+        gen: CrosswordGenerator = state["generator"]
+        store.save_success(
+            result, state["config"],
+            dictionary=gen.dictionary,
+            theme_cache_ref=gen._theme_cache_ref,
+        )
+
+    def _save_failure(error: Exception) -> None:
+        if not last_failure_state:
+            return
+        gen: CrosswordGenerator = last_failure_state["generator"]
+        store.save_failure(
+            last_failure_state["config"],
+            str(error),
+            grid=last_failure_state.get("grid"),
+            theme_words=last_failure_state.get("theme_words") or None,
+            crossword_title=gen._theme_crossword_title,
+            theme_content=gen._theme_content,
+            dictionary=gen.dictionary,
+            theme_cache_ref=gen._theme_cache_ref,
+        )
 
     attempt_index = 0
     while attempt_index < max_runs:
@@ -299,7 +345,11 @@ def run_debug(**overrides: Any) -> CrosswordResult:
         if batch_size == 1:
             attempt_no, attempt_kwargs = batch[0]
             try:
-                result = _run_single_attempt(attempt_no, attempt_kwargs, theme_retries)
+                result, state = _run_single_attempt(
+                    attempt_no, attempt_kwargs, theme_retries,
+                    _capture_state=last_failure_state,
+                )
+                _save_success(result, state)
                 return result
             except (ThemeWordError, CrosswordError) as exc:
                 LOGGER.warning(
@@ -320,11 +370,12 @@ def run_debug(**overrides: Any) -> CrosswordResult:
                 )
                 for attempt_no, attempt_kwargs in batch
             }
-            success: CrosswordResult | None = None
+            success_result: Optional[CrosswordResult] = None
+            success_state: Optional[Dict[str, Any]] = None
             for future in as_completed(futures):
                 attempt_no, attempt_kwargs = futures[future]
                 try:
-                    success = future.result()
+                    success_result, success_state = future.result()
                     LOGGER.info(
                         "Generation succeeded on attempt %s/%s (seed %s)",
                         attempt_no,
@@ -342,11 +393,13 @@ def run_debug(**overrides: Any) -> CrosswordResult:
                     )
                     last_error = exc
                     continue
-            if success:
+            if success_result is not None and success_state is not None:
                 for future in futures:
                     future.cancel()
-                return success
+                _save_success(success_result, success_state)
+                return success_result
 
+    _save_failure(last_error or CrosswordError("Unknown failure"))
     raise CrosswordError("Unable to generate crossword after retries") from last_error
 
 
@@ -354,19 +407,32 @@ def _run_single_attempt(
     attempt_no: int,
     attempt_overrides: Dict[str, Any],
     theme_retries: int,
-) -> CrosswordResult:
+    _capture_state: Optional[Dict[str, Any]] = None,
+) -> Tuple[CrosswordResult, Dict[str, Any]]:
+    """Run one generation attempt. Returns (result, state) on success.
+
+    On failure raises CrosswordError / ThemeWordError. If *_capture_state* is
+    provided it is updated with the attempt's state before re-raising, allowing
+    the caller to inspect grid / generator info for a failure document.
+    """
     state = prepare_state(**attempt_overrides)
-    step_seed_theme(state, retries=theme_retries)
-    pretty_print_grid(state['grid'])
-    step_fill(state)
-    validation = step_validate(state)
-    if validation and not validation.ok:
+    generator: CrosswordGenerator = state["generator"]
+    try:
+        step_seed_theme(state, retries=theme_retries)
         pretty_print_grid(state['grid'])
-        raise CrosswordError(f"Validation failed: {validation.messages}")
-    step_clues(state)
-    result = build_result(state)
-    print_crossword_stats(result, state["generator"].dictionary)
-    return result
+        step_fill(state)
+        validation = step_validate(state)
+        if validation and not validation.ok:
+            pretty_print_grid(state['grid'])
+            raise CrosswordError(f"Validation failed: {validation.messages}")
+        step_clues(state)
+        result = build_result(state)
+        print_crossword_stats(result, generator.dictionary)
+        return result, state
+    except (ThemeWordError, CrosswordError):
+        if _capture_state is not None:
+            _capture_state.update(state)
+        raise
 
 
 def main() -> None:  # pragma: no cover - manual helper
@@ -374,6 +440,17 @@ def main() -> None:  # pragma: no cover - manual helper
     print(f"Seed: {result.seed}")
     print(f"Generated {len(result.slots)} slots for theme '{DEFAULT_DEBUG_ARGS['theme_title']}'")
     print(f"Validation: {result.validation_messages or 'ok'}")
+
+    # # inspect processed dex words
+    # import pandas as pd
+    # from pathlib import Path
+    # tsv_path = Path("/Users/paul/Work/crosswords/crossword_generator/local_db/dex_words_processed.tsv")
+    # df = pd.read_csv(tsv_path, sep="\t", dtype=str, keep_default_na=False)
+    # df["difficulty_score"] = df["difficulty_score"].astype(float)
+    # bins = [0, 0.30, 0.60, 1.01]
+    # labels = ["EASY", "MEDIUM", "HARD"]
+    # df["tier"] = pd.cut(df["difficulty_score"], bins=bins, labels=labels, right=False)
+    # df["tier"].value_counts().sort_index()
 
 
 if __name__ == "__main__":

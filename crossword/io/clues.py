@@ -10,6 +10,7 @@ from typing import Dict, List, Protocol
 from ..core.constants import CellType
 from ..core.models import Clue, WordSlot
 from ..utils.logger import get_logger
+from .gemini_client import GeminiClient
 
 
 LOGGER = get_logger(__name__)
@@ -72,26 +73,30 @@ class GeminiClueGenerator:
         ),
     }
 
-    def __init__(self, model_name: str = "gemini-pro", api_key_env: str = "GOOGLE_API_KEY") -> None:
-        self.model_name = model_name
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash",
+        api_key_env: str = "GEMINI_API_KEY",
+        model_env: str = "GEMINI_MODEL",
+        gemini_client: GeminiClient | None = None,
+    ) -> None:
+        resolved_model = os.environ.get(model_env, model_name)
+        self.model_name = resolved_model
         self.api_key_env = api_key_env
+        self.model_env = model_env
+        self._client = gemini_client
 
     def generate(self, requests: List[ClueRequest],
                  difficulty: str = "MEDIUM", language: str = "Romanian") -> Dict[str, str]:  # pragma: no cover - external
-        api_key = os.environ.get(self.api_key_env)
-        if not api_key:
-            raise RuntimeError(
-                f"Missing Gemini API key in environment variable {self.api_key_env}"
-            )
-        try:
-            import google.generativeai as genai  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError("google-generativeai package required for Gemini integration") from exc
-
-        genai.configure(api_key=api_key)
         prompt = self._render_prompt(requests, difficulty, language)
-        response = genai.GenerativeModel(self.model_name).generate_content(prompt)
-        return self._parse_response(response.text)
+        client = self._client or GeminiClient(
+            model_name=self.model_name,
+            api_key_env=self.api_key_env,
+            model_env=self.model_env,
+        )
+        self._client = client
+        response_text = client.generate_text(prompt)
+        return self._parse_response(response_text)
 
     @classmethod
     def _render_prompt(cls, requests: List[ClueRequest],
