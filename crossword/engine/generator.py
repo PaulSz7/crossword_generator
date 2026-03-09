@@ -14,7 +14,7 @@ import heapq
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from ..io.clues import ClueGenerator, ClueRequest, TemplateClueGenerator, attach_clues_to_grid
+from ..io.clues import ClueBundle, ClueGenerator, ClueRequest, TemplateClueGenerator, attach_clues_to_grid
 from ..core.constants import CellType, Difficulty, Direction, ORTHOGONAL_STEPS
 from ..data.dictionary import DictionaryConfig, WordDictionary, WordEntry
 from ..core.exceptions import (ClueBoxError, CrosswordError, SlotPlacementError,
@@ -201,21 +201,72 @@ class CrosswordGenerator:
                             f"Grid validation failed: {validation.messages}"
                         )
                     slots = list(grid.word_slots.values())
-                    clue_requests = [
-                        ClueRequest(
-                            slot_id=slot.id,
-                            word=slot.text or "",
-                            direction=slot.direction.value,
-                            clue_box=slot.clue_box,
-                        )
-                        for slot in slots
-                    ]
+
+                    # Build theme word lookup: sanitized surface → ThemeWord
+                    theme_word_map = {
+                        self.dictionary.sanitize(tw.word): tw for tw in theme_words
+                    }
+
+                    # Categorize slots: fill words go to LLM, theme words use existing clues
+                    clue_requests: List[ClueRequest] = []
+                    theme_bundles: Dict[str, ClueBundle] = {}
+
+                    for slot in slots:
+                        word = slot.text or ""
+                        if not slot.is_theme:
+                            entry = self.dictionary.get(word)
+                            clue_requests.append(ClueRequest(
+                                slot_id=slot.id,
+                                word=word,
+                                direction=slot.direction.value,
+                                clue_box=slot.clue_box,
+                                definition=entry.definition if entry else None,
+                            ))
+                        else:
+                            tw = theme_word_map.get(word)
+                            if tw is None:
+                                # Fallback: send to LLM for full generation
+                                clue_requests.append(ClueRequest(
+                                    slot_id=slot.id,
+                                    word=word,
+                                    direction=slot.direction.value,
+                                    clue_box=slot.clue_box,
+                                ))
+                            elif tw.source == "gemini":
+                                # Gemini generated all three clue fields — use directly
+                                theme_bundles[slot.id] = ClueBundle(
+                                    main_clue=tw.clue,
+                                    hint_1=tw.long_clue or "",
+                                    hint_2=tw.hint or "",
+                                )
+                            elif tw.has_user_clue:
+                                # User provided explicit main clue — LLM generates hints only
+                                entry = self.dictionary.get(word)
+                                clue_requests.append(ClueRequest(
+                                    slot_id=slot.id,
+                                    word=word,
+                                    direction=slot.direction.value,
+                                    clue_box=slot.clue_box,
+                                    definition=entry.definition if entry else None,
+                                    preset_main_clue=tw.clue,
+                                ))
+                            else:
+                                # User word without clue, substring, or dummy — LLM generates all
+                                entry = self.dictionary.get(word)
+                                clue_requests.append(ClueRequest(
+                                    slot_id=slot.id,
+                                    word=word,
+                                    direction=slot.direction.value,
+                                    clue_box=slot.clue_box,
+                                    definition=entry.definition if entry else None,
+                                ))
+
                     clue_texts = self.clue_generator.generate(
                         clue_requests, difficulty=self.config.difficulty,
                         language=self.config.language,
                         theme=self.config.theme_title or "",
                     )
-                    attach_clues_to_grid(grid, slots, clue_texts)
+                    attach_clues_to_grid(grid, slots, {**clue_texts, **theme_bundles})
                     LOGGER.info("Crossword generation completed with %s words", len(slots))
                     result = CrosswordResult(
                         grid=grid,

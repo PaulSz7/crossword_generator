@@ -39,6 +39,7 @@ class ThemeWord:
     source: str = "unknown"
     long_clue: str = ""
     hint: str = ""
+    has_user_clue: bool = False
 
 
 @dataclass
@@ -134,6 +135,7 @@ For all clue fields (clue, long_clue, hint):
 - Avoid overly obvious clues
 - Avoid sensitive political, religious, hateful, sexual, or defamatory framing
 - Avoid repetitive wording or repeated clue structures across entries
+- PUNCTUATION: Use no punctuation at all unless strictly necessary. Ellipsis (...) is allowed only when intentional trailing ambiguity is needed. Exclamation mark (!) is allowed only for strong emphasis where clearly warranted. All other punctuation — periods, commas, semicolons, colons, question marks, hyphens, dashes, parentheses, quotation marks — is forbidden.
 
 DIFFICULTY CONTROL
 Adjust BOTH word selection AND clue style to the requested difficulty:
@@ -195,6 +197,7 @@ Before returning the final response, verify internally that:
 - all text is strictly in the requested language
 - clue style matches the requested difficulty level
 - word difficulty matches the requested difficulty level
+- no clue field uses punctuation unless strictly necessary (ellipsis only for intentional ambiguity, exclamation mark only for strong warranted emphasis)
 - the response matches the required JSON schema
 
 If any rule fails, revise internally until the output is valid."""
@@ -718,6 +721,7 @@ class UserWordListGenerator:
                 word, _, clue = item.partition(":")
                 word_clean = word.strip().upper()
                 clue_text = clue.strip()
+                has_user_clue = bool(clue_text)
                 self._theme_words.append(
                     ThemeWord(
                         word_clean,
@@ -725,6 +729,7 @@ class UserWordListGenerator:
                         "user",
                         long_clue=self._derive_long_clue(clue_text, word_clean),
                         hint=self._derive_hint(clue_text, word_clean),
+                        has_user_clue=has_user_clue,
                     )
                 )
             else:

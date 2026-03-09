@@ -16,11 +16,12 @@ Both `GeminiClueGenerator` and `GeminiThemeWordGenerator` were upgraded to a uni
 
 ### New/Modified Types
 - **`ClueBundle`** dataclass: `main_clue`, `hint_1`, `hint_2`
+- **`ClueRequest`** dataclass: `slot_id`, `word`, `direction`, `clue_box`, `definition: Optional[str]` (DEX context), `preset_main_clue: Optional[str]` (user-supplied clue echoed exactly)
 - **`Clue`** model (`crossword/core/models.py`): added `hint_1: str = ""`, `hint_2: str = ""`
 
 ### Constants
-- **`SYSTEM_INSTRUCTION`**: general behavior, safety check, clue field requirements (main_clue/hint_1/hint_2), strict restrictions, short word special rule, theme integration, difficulty control (per-field per-tier), best-candidate selection, style variation, self-validation
-- **`MAIN_PROMPT_TEMPLATE`**: `{{LANGUAGE}}`, `{{THEME}}`, `{{DIFFICULTY}}`, `{{WORD_LIST_JSON}}`
+- **`SYSTEM_INSTRUCTION`**: general behavior, safety check, clue field requirements (main_clue/hint_1/hint_2), strict restrictions (including punctuation rule), short word special rule, theme integration, difficulty control (per-field per-tier), best-candidate selection, style variation, definitions section, preset main clues section, self-validation
+- **`MAIN_PROMPT_TEMPLATE`**: `{{LANGUAGE}}`, `{{THEME}}`, `{{DIFFICULTY}}`, `{{WORD_LIST_JSON}}`, `{{DEFINITIONS_SECTION}}`, `{{PRESET_CLUES_SECTION}}`
 - **`CLUE_RESPONSE_SCHEMA`**: `{status, clues: [{answer, main_clue, hint_1, hint_2}], error: {reason, invalid_words}}`
 
 ### Clue Field Constraints
@@ -53,18 +54,29 @@ Both `GeminiClueGenerator` and `GeminiThemeWordGenerator` were upgraded to a uni
 
 ### `generate()` Flow
 1. Build `answer → [slot_id, ...]` reverse map
-2. Render prompt via `MAIN_PROMPT_TEMPLATE`
+2. Render prompt via `_render_prompt(word_list, difficulty, language, theme, requests)` — injects `DEFINITIONS_SECTION` and `PRESET_CLUES_SECTION` only when any request carries a definition or preset clue
 3. Call Gemini with `system_instruction` + `response_schema`
 4. Parse JSON; handle `status="error"` → return empty
 5. Validate → repair if needed → merge
-6. Map `answer → ClueBundle` back to `slot_id → ClueBundle`
+6. Post-process: for any request with `preset_main_clue`, override `bundle.main_clue` with the preset value regardless of LLM output
+7. Map `answer → ClueBundle` back to `slot_id → ClueBundle`
 
 ### Call Site Updates
-- `generator.py`: passes `theme=self.config.theme_title`
+- `generator.py`: categorizes slots before calling `generate()` — Gemini theme words go directly to `theme_bundles`, bypassing the LLM entirely; see clue routing table below
 - `debug_main.py`: passes `theme=state["generator"].config.theme_title or ""`
 - `crossword_store.py`: serializes `hint_1`, `hint_2` in `_extract_clues()`
 - `ClueGenerator` Protocol and `TemplateClueGenerator`: return `Dict[str, ClueBundle]`
-- `attach_clues_to_grid`: accepts `Dict[str, ClueBundle]`, sets `hint_1`/`hint_2` on `Clue`
+- `attach_clues_to_grid`: accepts merged `{**clue_texts, **theme_bundles}`, sets `hint_1`/`hint_2` on `Clue`
+
+### Clue Routing (generator.py)
+
+| Theme word source | `has_user_clue` | Routing |
+|---|---|---|
+| `"gemini"` | any | → `theme_bundles` directly (no LLM call) |
+| `"user"` | True | → `clue_requests` with `preset_main_clue`; LLM generates hints only |
+| `"user"` | False | → `clue_requests` for full LLM generation |
+| `"substring"` / `"dummy"` | — | → `clue_requests` for full LLM generation |
+| fill word | — | → `clue_requests` with `definition` from `dictionary.get(word)` |
 
 ---
 
@@ -79,6 +91,9 @@ Both `GeminiClueGenerator` and `GeminiThemeWordGenerator` were upgraded to a uni
 ### Removed
 - Old class attributes: `SYSTEM_INSTRUCTION`, `RESPONSE_SCHEMA_TEMPLATE`, `THEME_DIFFICULTY_PROMPT`
 - Old `_build_system_instruction()` method (system instruction is now a static constant)
+
+### Punctuation Rule (both generators)
+All clue fields must contain no punctuation other than ellipsis (`...`, for intentional trailing ambiguity only) or exclamation mark (`!`, for the short-word riddle style or strong warranted emphasis only). This rule appears in both `SYSTEM_INSTRUCTION` and `THEME_SYSTEM_INSTRUCTION` under STRICT CLUE RESTRICTIONS and SELF-VALIDATION.
 
 ### Word Generation Rules (CRITICAL)
 - Every word MUST be a real word in the requested language — foreign words strictly forbidden
@@ -149,7 +164,7 @@ Same pattern as clue generator:
 | `tests/test_theme.py` | New: `CountSentencesTests` (7), `ValidateThemeWordsTests` (11). Updated: `GeminiPromptTemplateTests` |
 
 ## Verification
-1. **Tests**: `.venv/bin/python -m pytest tests/ -v` — all 83 pass
+1. **Tests**: `.venv/bin/python -m pytest tests/ -v` — all 85 pass
 2. **New test coverage**: `_count_sentences`, `_validate_theme_words`, `_parse_response` error/tuple return, `_build_theme_words`, schema structure, system instruction sections
 3. **Integration**: `python main.py --theme-title "animale" --difficulty EASY`
 4. **Safety path**: `status="error"` → returns empty `ThemeOutput` / empty `dict`

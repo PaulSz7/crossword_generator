@@ -101,15 +101,35 @@ python main.py --height 10 --width 12 --theme-title mitologie --llm
 
 Gemini prompts return a single JSON object for every theme type with the fields:
 `crossword_title` (nullable), `content` (nullable summary or joke text), and `words`.
-Each entry inside `words` now contains:
+Each entry inside `words` contains:
 
 - `word` — uppercase solution text
 - `clue` — ultra-short (1–3 word) clue printed inside the grid
-- `long_clue` — full cryptic clue (6–16 words) surfaced in detailed views
-- `hint` — premium helper sentence sold as an extra hint
+- `long_clue` — full clue sentence surfaced in detailed views
+- `hint` — premium progressive hint sold as an extra hint
 
 This uniform contract keeps downstream validation simple regardless of mode and gives the UI
 multiple clue granularities to sell or reveal.
+
+### Clue generation routing
+
+After CP-SAT fill, clues are assigned per word based on its origin:
+
+| Origin | Behaviour |
+|---|---|
+| Gemini theme word | Clue/hints from theme generation used directly — no LLM call |
+| User word with explicit clue (`WORD:clue`) | User text becomes `main_clue`; LLM generates `hint_1` and `hint_2` only |
+| User word without clue (`WORD`) | LLM generates all three fields |
+| Substring / dummy theme word | LLM generates all three fields |
+| Fill word (non-theme) | LLM generates all three fields; DEX definition passed as reference context |
+
+Fill word requests include the word's DEX definition so the LLM can generate
+informed clues for uncommon words without being constrained to reproduce the
+definition verbatim.
+
+All generated clue text must contain no punctuation other than ellipsis (`...`)
+where intentional trailing ambiguity is needed, or exclamation mark (`!`) for
+the short-word riddle style.
 
 The fallback chain for each mode:
 
@@ -300,7 +320,7 @@ Run tests:
 poetry run pytest
 ```
 
-All 61 tests should pass.
+All 85 tests should pass.
 
 ## How It Works
 

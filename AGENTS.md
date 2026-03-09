@@ -137,10 +137,14 @@ def fill_crossword(grid):
    * Also, the validation should check the correct existence of each `CLUE_BOX`
    * All these checks should be made at every step by querying the dex_words data to check for existing words with the verified pattern.
 
-**III. LLM Clue generation: **
-1. At this stage, we filled all the empty cells with valid letters and clue cells. We’ll collect all the words and clue cells they belong to (remember, multiple words could belong to a single clue cell) and use them in a Gemini prompt to generate distinct 3-4 words long clues for each word. 
-2. We’ll add the generated clues to the clue cell object accordingly to the direction of each word.
-3. Finally, we validate the fully completed grid with an LLM prompt so all the clue-words make sense and the words are interlocked correctly.
+**III. LLM Clue generation:**
+1. After CP-SAT fill, words are routed to one of two paths based on origin:
+   - **Gemini theme words**: clue/long_clue/hint from the theme generation phase are used directly — no LLM call.
+   - **All other words** (fill words, user words without a clue, substring/dummy theme words): sent to `GeminiClueGenerator` for full generation of `main_clue`, `hint_1`, and `hint_2`.
+   - **User words with an explicit clue** (`WORD:clue` syntax): the user-supplied text is used as `main_clue` unchanged; the LLM generates only `hint_1` and `hint_2`.
+2. Fill word requests include the word’s DEX definition as reference context so the LLM can produce informed clues for uncommon words.
+3. All clue text must use no punctuation except ellipsis (`...`) for intentional ambiguity or exclamation mark (`!`) for the short-word riddle style.
+4. Generated clues are applied to the clue cell objects via `attach_clues_to_grid`.
 
 **IV. General Advice:**
 1. Provide meaningful logging and debugging messages at each step for better initial development.
@@ -193,13 +197,17 @@ Must NOT:
 
 ### ✍️ Clue / LLM Agent
 Responsibilities:
-- Generate Romanian clues (cryptic & straight)
+- Generate Romanian clues (cryptic & straight) for fill words and non-Gemini theme words
+- Preserve user-provided `main_clue` values exactly; generate only hints for these words
+- Pass DEX definitions as reference context for uncommon fill words
 - Ensure multiple clues per clue box are supported
 - Validate clue–answer consistency
 
 Constraints:
 - No grid modification
 - No letter changes
+- Must not overwrite Gemini-generated theme clues — those bypass the LLM entirely
+- No punctuation in clue text except `...` (intentional ambiguity) or `!` (riddle style)
 
 ---
 

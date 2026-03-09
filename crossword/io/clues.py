@@ -24,6 +24,8 @@ class ClueRequest:
     word: str
     direction: str
     clue_box: tuple[int, int]
+    definition: Optional[str] = None          # DEX definition for LLM context
+    preset_main_clue: Optional[str] = None    # user-provided clue; LLM generates hints only
 
 
 @dataclass
@@ -98,6 +100,7 @@ For all clue fields:
 - Avoid overly obvious clues
 - Avoid sensitive political, religious, hateful, sexual, or defamatory framing
 - Avoid repetitive wording or repeated clue structures across the list
+- PUNCTUATION: Use no punctuation at all unless strictly necessary. Ellipsis (...) is allowed only when intentional trailing ambiguity is needed. Exclamation mark (!) is allowed only for the short-word riddle style described above. All other punctuation — periods, commas, semicolons, colons, question marks, hyphens, dashes, parentheses, quotation marks — is forbidden.
 
 SHORT WORD SPECIAL RULE
 For answers of length 2 or 3, especially abbreviations or compact entries, main_clue may use playful crossword-riddle logic such as:
@@ -172,9 +175,16 @@ Before returning the final response, verify internally that:
 - all clue text is strictly in the requested language
 - clue style matches the requested difficulty level
 - clue wording is not duplicated excessively across entries
+- no clue field uses punctuation unless strictly necessary (ellipsis only for intentional ambiguity, exclamation mark only for the riddle style)
 - the response matches the required JSON schema
 
-If any rule fails, revise internally until the output is valid."""
+If any rule fails, revise internally until the output is valid.
+
+DEFINITIONS (provided for some words)
+Use the provided definition as contextual background only. Do NOT reproduce it verbatim. The word may have other meanings — generate clues freely from any angle.
+
+PRESET MAIN CLUES
+For words marked with a preset_main_clue, echo that value exactly in the `main_clue` field. Generate only `hint_1` and `hint_2` for these words."""
 
 MAIN_PROMPT_TEMPLATE = """\
 Generate crossword clues for all provided words.
@@ -186,6 +196,7 @@ DIFFICULTY: {{DIFFICULTY}}
 WORD LIST (JSON array):
 {{WORD_LIST_JSON}}
 
+{{DEFINITIONS_SECTION}}{{PRESET_CLUES_SECTION}}
 Requirements:
 - Return one clue object for each input word.
 - Preserve the original answer exactly in the "answer" field.
@@ -279,7 +290,7 @@ class GeminiClueGenerator:
             answer_to_slots.setdefault(word_upper, []).append(req.slot_id)
 
         word_list = list(answer_to_slots.keys())
-        prompt = self._render_prompt(word_list, difficulty, language, theme)
+        prompt = self._render_prompt(word_list, difficulty, language, theme, requests)
 
         client = self._get_client()
         response_text = client.generate_text(
@@ -321,12 +332,19 @@ class GeminiClueGenerator:
                         ", ".join(e.get("answer", "?") for e in still_invalid),
                     )
 
+        # Build preset_main_clue lookup: word_upper → preset clue
+        preset_clues: Dict[str, str] = {}
+        for req in requests:
+            if req.preset_main_clue:
+                preset_clues[req.word.upper()] = req.preset_main_clue
+
         # Map answer → ClueBundle → slot_id → ClueBundle
         result: Dict[str, ClueBundle] = {}
         for entry in valid:
             answer = entry["answer"].upper()
+            preset = preset_clues.get(answer)
             bundle = ClueBundle(
-                main_clue=entry["main_clue"],
+                main_clue=preset if preset else entry["main_clue"],
                 hint_1=entry["hint_1"],
                 hint_2=entry["hint_2"],
             )
@@ -337,15 +355,37 @@ class GeminiClueGenerator:
 
     @staticmethod
     def _render_prompt(word_list: List[str], difficulty: str,
-                       language: str, theme: str) -> str:
+                       language: str, theme: str,
+                       requests: Optional[List[ClueRequest]] = None) -> str:
         """Fill the main prompt template with concrete values."""
         word_list_json = json.dumps(word_list, ensure_ascii=False)
+
+        definitions_section = ""
+        preset_clues_section = ""
+
+        if requests:
+            defs = [(req.word.upper(), req.definition) for req in requests if req.definition]
+            if defs:
+                lines = ["WORD DEFINITIONS (reference context only — do not copy verbatim):"]
+                for word, defn in defs:
+                    lines.append(f"{word}: {defn}")
+                definitions_section = "\n".join(lines) + "\n\n"
+
+            presets = [(req.word.upper(), req.preset_main_clue) for req in requests if req.preset_main_clue]
+            if presets:
+                lines = ["PRESET MAIN CLUES (echo exactly in main_clue field, generate only hint_1 and hint_2):"]
+                for word, preset in presets:
+                    lines.append(f"{word}: {preset}")
+                preset_clues_section = "\n".join(lines) + "\n\n"
+
         return (
             MAIN_PROMPT_TEMPLATE
             .replace("{{LANGUAGE}}", language)
             .replace("{{THEME}}", theme or "(no theme)")
             .replace("{{DIFFICULTY}}", difficulty.upper() if difficulty else "MEDIUM")
             .replace("{{WORD_LIST_JSON}}", word_list_json)
+            .replace("{{DEFINITIONS_SECTION}}", definitions_section)
+            .replace("{{PRESET_CLUES_SECTION}}", preset_clues_section)
         )
 
     @staticmethod

@@ -28,26 +28,12 @@ The existing `merge_theme_generators` function already handles this cascading pa
 
 ### 1. `crossword/data/theme.py` — Add `UserWordListGenerator`
 
-```python
-class UserWordListGenerator:
-    """Returns a user-supplied list of words as ThemeWord objects."""
+`UserWordListGenerator` parses `WORD` or `WORD:clue` entries. When the user provides explicit clue text, `ThemeWord.has_user_clue` is set to `True`. This flag controls clue routing in `generator.py`:
 
-    def __init__(self, raw_words: List[str]) -> None:
-        self._theme_words: List[ThemeWord] = []
-        for item in raw_words:
-            item = item.strip()
-            if not item:
-                continue
-            if ":" in item:
-                word, _, clue = item.partition(":")
-                self._theme_words.append(ThemeWord(word.strip().upper(), clue.strip(), "user"))
-            else:
-                self._theme_words.append(ThemeWord(item.upper(), "", "user"))
+- `has_user_clue=True` → user text becomes `main_clue`; LLM generates `hint_1`/`hint_2` only
+- `has_user_clue=False` → LLM generates all three clue fields
 
-    def generate(self, theme: str, limit: int = 80,
-                 difficulty: str = "MEDIUM", language: str = "Romanian") -> List[ThemeWord]:
-        return list(self._theme_words)  # always returns user's words, ignores theme/limit
-```
+The `_derive_short_clue`, `_derive_long_clue`, and `_derive_hint` heuristics on `UserWordListGenerator` are used internally but are no longer the final clue values — they are only fallback seeds used if the routing sends the word to `theme_bundles` directly (which does not happen for user-source words).
 
 ### 2. `crossword/engine/generator.py` — Two small changes
 
@@ -184,7 +170,7 @@ ATHENA:Zeita intelepciunii
 
 1. **Existing mode unchanged**: `--theme mitologie` → output `theme_words` have `source: "dummy"`, no regression.
 2. **Words-only**: `--words APOLON ARES ATHENA` → all three in output with `source: "user"`, zero `source: "dummy"` entries.
-3. **Inline clues**: `--words 'APOLON:Zeul soarelui'` → `theme_words[0].clue == "Zeul soarelui"`.
+3. **Inline clues**: `--words 'APOLON:Zeul soarelui'` → `theme_words[0].has_user_clue == True` and `theme_words[0].clue == "Zeul soarelui"` (used as `main_clue`; LLM generates hints).
 4. **Words file**: `--words-file` with a valid file produces correct theme words; `#` comments are skipped.
 5. **Hybrid mode**: `--words APOLON --theme mitologie --llm` → output contains `APOLON` (user) plus additional words with `source: "gemini"`.
 6. **Hybrid with description**: `--theme-description` text appears in the LLM prompt context (verify via `--log-level DEBUG`).
