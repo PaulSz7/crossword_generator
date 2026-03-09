@@ -19,6 +19,8 @@ class Clue:
     direction: Direction
     start_offset_r: int
     start_offset_c: int
+    hint_1: str = ""
+    hint_2: str = ""
 
 
 @dataclass

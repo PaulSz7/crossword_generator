@@ -70,14 +70,17 @@ class ThemeCache:
             LOGGER.warning("Theme cache read error (%s): %s", path.name, exc)
             return None
 
-        words = [
-            ThemeWord(
-                word=w["word"],
-                clue=w.get("clue", ""),
-                source=w.get("source", "gemini"),
+        words = []
+        for w in doc.get("words", []):
+            words.append(
+                ThemeWord(
+                    word=w["word"],
+                    clue=w.get("clue", ""),
+                    source=w.get("source", "gemini"),
+                    long_clue=w.get("long_clue", ""),
+                    hint=w.get("hint", ""),
+                )
             )
-            for w in doc.get("words", [])
-        ]
         if len(words) < min_words:
             LOGGER.debug(
                 "Theme cache hit but too few words (%d < %d): %s",
@@ -135,7 +138,13 @@ class ThemeCache:
                 }
                 for tw in theme_output.words:
                     key = tw.word.upper()
-                    existing[key] = {"word": tw.word, "clue": tw.clue, "source": tw.source}
+                    existing[key] = {
+                        "word": tw.word,
+                        "clue": tw.clue,
+                        "long_clue": tw.long_clue,
+                        "hint": tw.hint,
+                        "source": tw.source,
+                    }
                 doc["words"] = list(existing.values())
                 doc["updated_at"] = now
                 if theme_output.crossword_title:
@@ -176,7 +185,13 @@ class ThemeCache:
             "created_at": created_at,
             "updated_at": updated_at,
             "words": [
-                {"word": tw.word, "clue": tw.clue, "source": tw.source}
+                {
+                    "word": tw.word,
+                    "clue": tw.clue,
+                    "long_clue": tw.long_clue,
+                    "hint": tw.hint,
+                    "source": tw.source,
+                }
                 for tw in theme_output.words
             ],
             "crossword_title": theme_output.crossword_title,

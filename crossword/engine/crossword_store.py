@@ -60,7 +60,13 @@ class CrosswordStore:
             "crossword_title": result.crossword_title,
             "theme_content": result.theme_content,
             "theme_words": [
-                {"word": tw.word, "clue": tw.clue, "source": tw.source}
+                {
+                    "word": tw.word,
+                    "clue": tw.clue,
+                    "long_clue": tw.long_clue,
+                    "hint": tw.hint,
+                    "source": tw.source,
+                }
                 for tw in result.theme_words
             ],
             "slots": self._serialize_slots(result.slots),
@@ -103,7 +109,13 @@ class CrosswordStore:
             "crossword_title": crossword_title,
             "theme_content": theme_content,
             "theme_words": [
-                {"word": tw.word, "clue": tw.clue, "source": tw.source}
+                {
+                    "word": tw.word,
+                    "clue": tw.clue,
+                    "long_clue": tw.long_clue,
+                    "hint": tw.hint,
+                    "source": tw.source,
+                }
                 for tw in (theme_words or [])
             ],
             "grid": grid.to_jsonable() if grid is not None else None,
@@ -132,6 +144,8 @@ class CrosswordStore:
                     clues.append({
                         "id": clue.id,
                         "text": clue.text,
+                        "hint_1": clue.hint_1,
+                        "hint_2": clue.hint_2,
                         "solution_word_ref_id": clue.solution_word_ref_id,
                         "solution_length": clue.solution_length,
                         "direction": clue.direction.value,

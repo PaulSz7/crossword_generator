@@ -95,6 +95,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="Romanian",
         help="Target language for clues and theme words",
     )
+    parser.add_argument(
+        "--clues",
+        action="store_true",
+        help="Generate LLM clues via Gemini (requires GEMINI_API_KEY)",
+    )
     parser.add_argument("--output", type=Path, help="Optional path to JSON output")
     parser.add_argument(
         "--log-level",
@@ -201,6 +206,7 @@ def main(argv: list[str] | None = None) -> None:
     fallbacks = None  # None → CrosswordGenerator will use default [DummyThemeWordGenerator]
 
     from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator
+    from crossword.io.clues import GeminiClueGenerator
 
     if theme_type == "words_containing_substring":
         # SubstringThemeWordGenerator is always wired inside _seed_theme_words.
@@ -257,10 +263,13 @@ def main(argv: list[str] | None = None) -> None:
                 fallbacks = []
         # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
 
+    clue_gen = GeminiClueGenerator() if args.clues else None
+
     generator = CrosswordGenerator(
         config,
         theme_generator=theme_gen,
         theme_fallback_generators=fallbacks,
+        clue_generator=clue_gen,
         store=crossword_store,
         theme_cache=theme_cache,
     )

@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import MagicMock
 
@@ -5,11 +6,15 @@ from crossword.data.theme import (
     DummyThemeWordGenerator,
     GeminiThemeWordGenerator,
     SubstringThemeWordGenerator,
+    THEME_SYSTEM_INSTRUCTION,
     ThemeOutput,
     ThemeType,
     ThemeWord,
     ThemeWordGenerator,
     UserWordListGenerator,
+    _count_sentences,
+    _is_severe_theme_violation,
+    _validate_theme_words,
     merge_theme_generators,
 )
 
@@ -33,11 +38,13 @@ class ThemeOutputTests(unittest.TestCase):
         self.assertIsNone(out.content)
 
     def test_with_words(self) -> None:
-        words = [ThemeWord("ZEUS", "Rege", "user")]
+        words = [ThemeWord("ZEUS", "Rege", "user", long_clue="Rege al Olimpului", hint="Hint text")]
         out = ThemeOutput(words=words, crossword_title="Mitologie", content="Zeii greci")
         self.assertEqual(len(out.words), 1)
         self.assertEqual(out.crossword_title, "Mitologie")
         self.assertEqual(out.content, "Zeii greci")
+        self.assertEqual(out.words[0].long_clue, "Rege al Olimpului")
+        self.assertEqual(out.words[0].hint, "Hint text")
 
 
 class DummyThemeGeneratorTests(unittest.TestCase):
@@ -92,10 +99,14 @@ class UserWordListGeneratorTests(unittest.TestCase):
         self.assertEqual(len(result.words), 1)
         self.assertEqual(result.words[0].word, "APOLON")
         self.assertEqual(result.words[0].clue, "Zeul soarelui")
+        self.assertEqual(result.words[0].long_clue, "Zeul soarelui")
+        self.assertTrue(result.words[0].hint.startswith("Context:"))
 
     def test_plain_word_has_empty_clue(self) -> None:
         gen = UserWordListGenerator(["ARES"])
-        self.assertEqual(gen.generate("").words[0].clue, "")
+        clue = gen.generate("").words[0].clue
+        self.assertTrue(clue.startswith("Tematic"))
+        self.assertLessEqual(len(clue.split()), 3)
 
     def test_source_is_always_user(self) -> None:
         gen = UserWordListGenerator(["ZEUS", "ARES:Zeul razboiului"])
@@ -115,7 +126,7 @@ class UserWordListGeneratorTests(unittest.TestCase):
         gen = UserWordListGenerator(["ZEUS:Rege", "ARES", "ATHENA:Intelepciune"])
         words = gen.generate("").words
         self.assertEqual(words[0].clue, "Rege")
-        self.assertEqual(words[1].clue, "")
+        self.assertTrue(words[1].clue.startswith("Tematic"))
         self.assertEqual(words[2].clue, "Intelepciune")
 
     def test_whitespace_trimmed_from_word_and_clue(self) -> None:
@@ -254,7 +265,7 @@ class SubstringThemeWordGeneratorTests(unittest.TestCase):
         gen = SubstringThemeWordGenerator(mock_dict, "BERE")
         result = gen.generate("BERE")
         self.assertEqual(len(result.words), 1)
-        self.assertIn("BERE", result.words[0].clue)
+        self.assertIn("BERE", result.words[0].clue.upper())
 
     def test_source_is_substring(self) -> None:
         mock_dict = self._make_mock_dictionary(["BERERIE"])
@@ -372,19 +383,123 @@ class SubstringWithUserWordsTests(unittest.TestCase):
         self.assertEqual(bere_entry.source, "user")
 
 
+class CountSentencesTests(unittest.TestCase):
+    def test_empty(self) -> None:
+        self.assertEqual(_count_sentences(""), 0)
+        self.assertEqual(_count_sentences("   "), 0)
+
+    def test_no_punctuation(self) -> None:
+        self.assertEqual(_count_sentences("A simple phrase"), 1)
+
+    def test_one_sentence_with_period(self) -> None:
+        self.assertEqual(_count_sentences("A simple phrase."), 1)
+
+    def test_two_sentences(self) -> None:
+        self.assertEqual(_count_sentences("First. Second."), 2)
+
+    def test_three_sentences(self) -> None:
+        self.assertEqual(_count_sentences("One. Two. Three."), 3)
+
+    def test_exclamation(self) -> None:
+        self.assertEqual(_count_sentences("Wow! Great."), 2)
+
+    def test_question(self) -> None:
+        self.assertEqual(_count_sentences("What? Yes."), 2)
+
+
+class SeverityClassificationTests(unittest.TestCase):
+    def test_severe_violations(self) -> None:
+        self.assertTrue(_is_severe_theme_violation("missing required field(s)"))
+        self.assertTrue(_is_severe_theme_violation("word 'ze!us' is not valid uppercase A-Z with 2+ letters"))
+        self.assertTrue(_is_severe_theme_violation("duplicate word 'ZEUS'"))
+        self.assertTrue(_is_severe_theme_violation("clue contains the answer 'ZEUS'"))
+
+    def test_cosmetic_violations(self) -> None:
+        self.assertFalse(_is_severe_theme_violation("clue exceeds 3 words (4 words)"))
+        self.assertFalse(_is_severe_theme_violation("long_clue must be one phrase but has 2 sentences"))
+        self.assertFalse(_is_severe_theme_violation("hint exceeds 2 phrases (3 sentences)"))
+
+
+class ValidateThemeWordsTests(unittest.TestCase):
+    def _good_entry(self, word="ZEUS", clue="Rege olimp", long_clue="Conducatorul zeilor pe muntele sfant.", hint="Pista: cel mai mare."):
+        return {"word": word, "clue": clue, "long_clue": long_clue, "hint": hint}
+
+    def test_valid_entry_passes(self) -> None:
+        valid, needs_repair = _validate_theme_words([self._good_entry()])
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(needs_repair), 0)
+
+    def test_missing_field_flagged_for_repair(self) -> None:
+        entry = {"word": "ZEUS", "clue": "Rege", "long_clue": "", "hint": "Pista"}
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(needs_repair), 1)
+        self.assertIn("missing", needs_repair[0]["violations"][0])
+
+    def test_invalid_word_format_flagged_for_repair(self) -> None:
+        entry = self._good_entry(word="ze!us")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(needs_repair), 1)
+        self.assertTrue(any("not valid" in v for v in needs_repair[0]["violations"]))
+
+    def test_single_letter_word_flagged_for_repair(self) -> None:
+        entry = self._good_entry(word="A")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(needs_repair), 1)
+
+    def test_clue_exceeds_3_words_is_cosmetic(self) -> None:
+        # Cosmetic violation — entry accepted, no repair triggered
+        entry = self._good_entry(clue="Un rege foarte mare")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(needs_repair), 0)
+
+    def test_long_clue_multiple_sentences_is_cosmetic(self) -> None:
+        # Cosmetic violation — entry accepted, no repair triggered
+        entry = self._good_entry(long_clue="Prima propozitie. A doua propozitie.")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(needs_repair), 0)
+
+    def test_hint_three_sentences_is_cosmetic(self) -> None:
+        # Cosmetic violation — entry accepted, no repair triggered
+        entry = self._good_entry(hint="Unu. Doi. Trei.")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(needs_repair), 0)
+
+    def test_hint_two_sentences_passes(self) -> None:
+        entry = self._good_entry(hint="Prima propozitie. A doua propozitie.")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(valid), 1)
+
+    def test_answer_in_clue_flagged_for_repair(self) -> None:
+        entry = self._good_entry(word="ZEUS", clue="Zeus mare")
+        valid, needs_repair = _validate_theme_words([entry])
+        self.assertEqual(len(needs_repair), 1)
+        self.assertTrue(any("contains the answer" in v for v in needs_repair[0]["violations"]))
+
+    def test_duplicate_words_flagged_for_repair(self) -> None:
+        entries = [self._good_entry(), self._good_entry()]
+        valid, needs_repair = _validate_theme_words(entries)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(needs_repair), 1)
+        self.assertTrue(any("duplicate" in v for v in needs_repair[0]["violations"]))
+
+
 class GeminiPromptTemplateTests(unittest.TestCase):
     def test_domain_specific_prompt_contains_theme(self) -> None:
         gen = GeminiThemeWordGenerator(theme_type="domain_specific_words")
         prompt = gen._render_prompt("mitologie", limit=50)
-        self.assertIn("mitologie", prompt)
-        self.assertIn("JSON", prompt)
+        self.assertIn("THEME: mitologie", prompt)
+        self.assertIn("WORD COUNT:", prompt)
 
     def test_joke_continuation_prompt_structure(self) -> None:
         gen = GeminiThemeWordGenerator(theme_type="joke_continuation")
         prompt = gen._render_prompt("animale", limit=30)
         self.assertIn("animale", prompt)
-        self.assertIn("joke_text", prompt)
-        self.assertIn("words", prompt)
+        self.assertIn("joke", prompt.lower())
+        self.assertIn("content", prompt.lower())
+        self.assertIn("punchline", prompt.lower())
 
     def test_joke_continuation_with_description(self) -> None:
         gen = GeminiThemeWordGenerator(
@@ -393,6 +508,7 @@ class GeminiPromptTemplateTests(unittest.TestCase):
         )
         prompt = gen._render_prompt("animale", limit=30)
         self.assertIn("De ce nu mananca", prompt)
+        self.assertIn("verbatim", prompt.lower())
 
     def test_custom_prompt_structure(self) -> None:
         gen = GeminiThemeWordGenerator(
@@ -403,7 +519,6 @@ class GeminiPromptTemplateTests(unittest.TestCase):
         self.assertIn("Stiinte", prompt)
         self.assertIn("crossword_title", prompt)
         self.assertIn("content", prompt)
-        self.assertIn("words", prompt)
         self.assertIn("Un crossword despre stiinte", prompt)
 
     def test_difficulty_appended_to_all_types(self) -> None:
@@ -411,44 +526,146 @@ class GeminiPromptTemplateTests(unittest.TestCase):
             gen = GeminiThemeWordGenerator(theme_type=theme_type)
             for difficulty in ["EASY", "MEDIUM", "HARD"]:
                 prompt = gen._render_prompt("tema", limit=20, difficulty=difficulty)
-                self.assertTrue(len(prompt) > 50, f"Prompt too short for {theme_type}/{difficulty}")
+                self.assertIn(f"DIFFICULTY: {difficulty}", prompt)
+
+    def test_system_instruction_has_key_sections(self) -> None:
+        self.assertIn("crossword theme designer", THEME_SYSTEM_INSTRUCTION)
+        self.assertIn("DIFFICULTY CONTROL", THEME_SYSTEM_INSTRUCTION)
+        self.assertIn("EASY", THEME_SYSTEM_INSTRUCTION)
+        self.assertIn("HARD", THEME_SYSTEM_INSTRUCTION)
+        self.assertIn("long_clue", THEME_SYSTEM_INSTRUCTION)
+        self.assertIn("SAFETY CHECK", THEME_SYSTEM_INSTRUCTION)
+        self.assertIn("SELF-VALIDATION", THEME_SYSTEM_INSTRUCTION)
+
+    def test_response_schema_has_required_fields(self) -> None:
+        from crossword.data.theme import THEME_RESPONSE_SCHEMA
+        self.assertEqual(THEME_RESPONSE_SCHEMA["type"], "OBJECT")
+        self.assertIn("status", THEME_RESPONSE_SCHEMA["properties"])
+        self.assertIn("words", THEME_RESPONSE_SCHEMA["properties"])
+        word_props = THEME_RESPONSE_SCHEMA["properties"]["words"]["items"]["properties"]
+        self.assertIn("word", word_props)
+        self.assertIn("clue", word_props)
+        self.assertIn("long_clue", word_props)
+        self.assertIn("hint", word_props)
 
     def test_parse_response_domain_specific(self) -> None:
-        text = '{"word": "ZEUS", "clue": "Rege olimp"}\n{"word": "HERA", "clue": "Regina zeilor"}\n'
+        text = json.dumps({
+            "status": "ok",
+            "crossword_title": None,
+            "content": "Mitologia olimpiana.",
+            "words": [
+                {
+                    "word": "ZEUS",
+                    "clue": "Rege olimp",
+                    "long_clue": "Conducatorul zeilor pe muntele sacru.",
+                    "hint": "Cel mai puternic dintre zei.",
+                },
+                {
+                    "word": "HERA",
+                    "clue": "Regina zei",
+                    "long_clue": "Sotia conducatorului divin al Olimpului.",
+                    "hint": "Zeita casatoriei si a familiei.",
+                },
+            ],
+        })
         result = GeminiThemeWordGenerator._parse_response(text, "domain_specific_words")
-        self.assertIsInstance(result, ThemeOutput)
-        self.assertEqual(len(result.words), 2)
-        self.assertEqual(result.words[0].word, "ZEUS")
+        self.assertIsNotNone(result)
+        words, title, content = result
+        self.assertEqual(len(words), 2)
+        self.assertEqual(words[0]["word"], "ZEUS")
+        self.assertEqual(content, "Mitologia olimpiana.")
 
     def test_parse_response_joke_continuation(self) -> None:
-        text = '{"joke_text": "De ce...? Pentru ca!", "words": [{"word": "MOUSE", "clue": "Soarece digital"}]}'
+        text = json.dumps({
+            "status": "ok",
+            "content": "De ce...? Pentru ca!",
+            "crossword_title": None,
+            "words": [{
+                "word": "MOUSE",
+                "clue": "Soarece digital",
+                "long_clue": "Gadgetul care sperie un animal mare.",
+                "hint": "Dispozitivul de la calculator.",
+            }],
+        })
         result = GeminiThemeWordGenerator._parse_response(text, "joke_continuation")
-        self.assertIsInstance(result, ThemeOutput)
-        self.assertEqual(len(result.words), 1)
-        self.assertEqual(result.content, "De ce...? Pentru ca!")
-        self.assertIsNone(result.crossword_title)
+        self.assertIsNotNone(result)
+        words, title, content = result
+        self.assertEqual(len(words), 1)
+        self.assertEqual(content, "De ce...? Pentru ca!")
+        self.assertIsNone(title)
 
     def test_parse_response_custom(self) -> None:
-        text = '{"crossword_title": "Stiinte Exacte", "content": "Un tur prin stiinte.", "words": [{"word": "CHIMIE", "clue": "Stiinta moleculelor"}]}'
+        text = json.dumps({
+            "status": "ok",
+            "crossword_title": "Stiinte Exacte",
+            "content": "Un tur prin stiinte.",
+            "words": [{
+                "word": "CHIMIE",
+                "clue": "Laborator fin",
+                "long_clue": "Domeniul reactiilor si al formulelor.",
+                "hint": "Se studiaza in laborator.",
+            }],
+        })
         result = GeminiThemeWordGenerator._parse_response(text, "custom")
-        self.assertIsInstance(result, ThemeOutput)
-        self.assertEqual(result.crossword_title, "Stiinte Exacte")
-        self.assertEqual(result.content, "Un tur prin stiinte.")
-        self.assertEqual(len(result.words), 1)
+        self.assertIsNotNone(result)
+        words, title, content = result
+        self.assertEqual(title, "Stiinte Exacte")
+        self.assertEqual(content, "Un tur prin stiinte.")
+        self.assertEqual(len(words), 1)
 
     def test_parse_response_handles_markdown_fences(self) -> None:
-        text = '```json\n{"joke_text": "Gluma!", "words": [{"word": "ORAS", "clue": "Loc urban"}]}\n```'
+        text = (
+            "```json\n"
+            '{"status": "ok", "joke_text": "Gluma!", "words": [{"word": "ORAS", "clue": "Loc urban", '
+            '"long_clue": "Asezare cu multe cladiri.", '
+            '"hint": "Nu e sat."}]}\n'
+            "```"
+        )
         result = GeminiThemeWordGenerator._parse_response(text, "joke_continuation")
-        self.assertEqual(len(result.words), 1)
-        self.assertEqual(result.content, "Gluma!")
+        self.assertIsNotNone(result)
+        words, _, content = result
+        self.assertEqual(len(words), 1)
+        self.assertEqual(content, "Gluma!")
+
+    def test_parse_response_joke_text_fallback(self) -> None:
+        payload = {
+            "status": "ok",
+            "joke_text": "Gluma fallback!",
+            "words": [{
+                "word": "SOARE",
+                "clue": "Astru luminos",
+                "long_clue": "Steaua care lumineaza ziua.",
+                "hint": "Il vezi pe cerul zilei.",
+            }],
+        }
+        result = GeminiThemeWordGenerator._parse_response(json.dumps(payload), "joke_continuation")
+        self.assertIsNotNone(result)
+        _, _, content = result
+        self.assertEqual(content, "Gluma fallback!")
 
     def test_parse_response_empty_text(self) -> None:
         result = GeminiThemeWordGenerator._parse_response("", "domain_specific_words")
-        self.assertEqual(result.words, [])
+        self.assertIsNone(result)
 
     def test_parse_response_invalid_json(self) -> None:
         result = GeminiThemeWordGenerator._parse_response("not json at all", "joke_continuation")
-        self.assertEqual(result.words, [])
+        self.assertIsNone(result)
+
+    def test_parse_response_error_status(self) -> None:
+        text = json.dumps({"status": "error"})
+        result = GeminiThemeWordGenerator._parse_response(text, "domain_specific_words")
+        self.assertIsNone(result)
+
+    def test_build_theme_words_from_dicts(self) -> None:
+        dicts = [
+            {"word": "ZEUS", "clue": "Rege", "long_clue": "Cel mai mare.", "hint": "Pista."},
+            {"word": "HERA", "clue": "Regina", "long_clue": "Sotia regelui.", "hint": "Altceva."},
+        ]
+        entries = GeminiThemeWordGenerator._build_theme_words(dicts)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].word, "ZEUS")
+        self.assertEqual(entries[0].source, "gemini")
+        self.assertEqual(entries[1].clue, "Regina")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -31,7 +31,7 @@ from crossword.engine.crossword_store import CrosswordStore
 from crossword.data.preprocess import ensure_processed_dictionary
 from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator, ThemeType
 from crossword.data.theme_cache import ThemeCache
-from crossword.io.clues import ClueRequest, attach_clues_to_grid
+from crossword.io.clues import ClueRequest, GeminiClueGenerator, attach_clues_to_grid
 from crossword.utils.logger import configure_logging
 from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
 
@@ -46,6 +46,7 @@ DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "words": ["ROSU:Mac", "ALB:Ghiocel"],           # list of "WORD" or "WORD:Clue" strings
     "words_file": None,    # Path or str to a words file
     "llm": True,          # extend user words via Gemini (requires theme_title)
+    "clues": True,        # generate LLM clues via Gemini (requires GEMINI_API_KEY)
     "dictionary_path": Path("local_db/dex_words.tsv"),
     "seed": None,
     "completion_target": 1,
@@ -154,10 +155,13 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         else:
             fallbacks = []
 
+    clue_gen = GeminiClueGenerator() if bool(args.get("clues", False)) else None
+
     generator = CrosswordGenerator(
         config,
         theme_generator=theme_gen,
         theme_fallback_generators=fallbacks,
+        clue_generator=clue_gen,
         store=crossword_store,
         theme_cache=theme_cache,
     )
@@ -254,7 +258,13 @@ def step_clues(state: Dict[str, Any]):
         )
         for slot in state["slots"]
     ]
-    state["clue_texts"] = state["generator"].clue_generator.generate(requests)
+    config = state["generator"].config
+    state["clue_texts"] = state["generator"].clue_generator.generate(
+        requests,
+        difficulty=config.difficulty,
+        language=config.language,
+        theme=config.theme_title or "",
+    )
     attach_clues_to_grid(state["grid"], state["slots"], state["clue_texts"])
     return state["clue_texts"]
 

@@ -211,7 +211,9 @@ class CrosswordGenerator:
                         for slot in slots
                     ]
                     clue_texts = self.clue_generator.generate(
-                        clue_requests, difficulty=self.config.difficulty, language=self.config.language,
+                        clue_requests, difficulty=self.config.difficulty,
+                        language=self.config.language,
+                        theme=self.config.theme_title or "",
                     )
                     attach_clues_to_grid(grid, slots, clue_texts)
                     LOGGER.info("Crossword generation completed with %s words", len(slots))

@@ -99,6 +99,18 @@ export GEMINI_MODEL="gemini-2.5-flash"  # optional
 python main.py --height 10 --width 12 --theme-title mitologie --llm
 ```
 
+Gemini prompts return a single JSON object for every theme type with the fields:
+`crossword_title` (nullable), `content` (nullable summary or joke text), and `words`.
+Each entry inside `words` now contains:
+
+- `word` — uppercase solution text
+- `clue` — ultra-short (1–3 word) clue printed inside the grid
+- `long_clue` — full cryptic clue (6–16 words) surfaced in detailed views
+- `hint` — premium helper sentence sold as an extra hint
+
+This uniform contract keeps downstream validation simple regardless of mode and gives the UI
+multiple clue granularities to sell or reveal.
+
 The fallback chain for each mode:
 
 | Mode | Flags | Fallback chain |

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 from typing import Any, Dict, List, Optional
 
@@ -38,10 +40,32 @@ class GeminiClient:
                 f"Missing Gemini API key in environment variable {self.api_key_env}"
             )
 
-    def generate_text(self, prompt: str) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        system_instruction: Optional[str] = None,
+        response_schema: Optional[Dict[str, Any]] = None,
+        response_mime_type: Optional[str] = None,
+    ) -> str:
         """Send the prompt to Gemini and return the first candidate text."""
         url = f"{self.API_BASE}/models/{self.model_name}:generateContent"
-        payload = {"contents": [{"parts": [{"text": prompt}]}]}
+        contents = [{"role": "user", "parts": [{"text": prompt}]}]
+        payload: Dict[str, Any] = {"contents": contents}
+        if system_instruction:
+            payload["systemInstruction"] = {
+                "role": "system",
+                "parts": [{"text": system_instruction}],
+            }
+        generation_config: Dict[str, Any] = {}
+        if response_schema:
+            generation_config["responseMimeType"] = "application/json"
+            generation_config["responseSchema"] = response_schema
+        elif response_mime_type:
+            generation_config["responseMimeType"] = response_mime_type
+        if generation_config:
+            payload["generationConfig"] = generation_config
+
         try:
             response = requests.post(
                 url,
@@ -71,4 +95,24 @@ class GeminiClient:
                 text = part.get("text")
                 if text:
                     return text
+                inline_data = part.get("inlineData")
+                if inline_data:
+                    decoded = GeminiClient._decode_inline_data(inline_data)
+                    if decoded:
+                        return decoded
         return None
+
+    @staticmethod
+    def _decode_inline_data(inline_data: Dict[str, Any]) -> Optional[str]:
+        """Decode inline binary data (used for JSON structured responses)."""
+        data = inline_data.get("data")
+        if not data:
+            return None
+        try:
+            decoded = base64.b64decode(data)
+        except (ValueError, binascii.Error):  # pragma: no cover - data corruption
+            return None
+        try:
+            return decoded.decode("utf-8")
+        except UnicodeDecodeError:  # pragma: no cover - encoding issues
+            return None
