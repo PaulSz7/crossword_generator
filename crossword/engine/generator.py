@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import random
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 import heapq
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..io.clues import ClueBundle, ClueGenerator, ClueRequest, TemplateClueGenerator, attach_clues_to_grid
+from ..io.definition_fetcher import GeminiDefinitionFetcher, is_incomplete_definition
 from ..core.constants import CellType, Difficulty, Direction, ORTHOGONAL_STEPS
 from ..data.dictionary import DictionaryConfig, WordDictionary, WordEntry
 from ..core.exceptions import (ClueBoxError, CrosswordError, SlotPlacementError,
                                ThemeWordError, ValidationError)
-from .grid import CrosswordGrid, GridConfig
+from .grid import CrosswordGrid, GridConfig, MAX_CLUES_PER_BOX
 from ..utils.logger import get_logger
 from ..core.models import Clue, WordSlot
 from ..data.theme import (
@@ -139,6 +141,7 @@ class CrosswordGenerator:
         theme_fallback_generators: Optional[List[ThemeWordGenerator]] = None,
         store: Optional[CrosswordStore] = None,
         theme_cache: Optional[ThemeCache] = None,
+        dex_fetcher: Optional[GeminiDefinitionFetcher] = None,
     ) -> None:
         self.config = config
         self.rng = random.Random(config.seed)
@@ -153,6 +156,7 @@ class CrosswordGenerator:
         self.validator = GridValidator(self.dictionary)
         self.store = store
         self.theme_cache = theme_cache
+        self.dex_fetcher = dex_fetcher
         self.used_words: Set[str] = set()
         self.remaining_theme_words: Set[str] = set()
         self.theme_word_surfaces: Set[str] = set()
@@ -207,6 +211,23 @@ class CrosswordGenerator:
                         self.dictionary.sanitize(tw.word): tw for tw in theme_words
                     }
 
+                    # Collect words missing or with truncated local definitions for batch lookup
+                    words_needing_def = [
+                        slot.text for slot in slots
+                        if slot.text and (
+                            (e := self.dictionary.get(slot.text)) is None
+                            or is_incomplete_definition(e.definition or "")
+                        )
+                    ]
+                    fetched_defs: Dict[str, str] = {}
+                    if words_needing_def and self.dex_fetcher:
+                        LOGGER.info(
+                            "Fetching definitions for %d word(s) via DEX: %s",
+                            len(words_needing_def),
+                            ", ".join(words_needing_def),
+                        )
+                        fetched_defs = self.dex_fetcher.fetch_batch(words_needing_def)
+
                     # Categorize slots: fill words go to LLM, theme words use existing clues
                     clue_requests: List[ClueRequest] = []
                     theme_bundles: Dict[str, ClueBundle] = {}
@@ -220,7 +241,7 @@ class CrosswordGenerator:
                                 word=word,
                                 direction=slot.direction.value,
                                 clue_box=slot.clue_box,
-                                definition=entry.definition if entry else None,
+                                definition=fetched_defs.get(word) or (entry.definition if entry else None),
                             ))
                         else:
                             tw = theme_word_map.get(word)
@@ -247,7 +268,7 @@ class CrosswordGenerator:
                                     word=word,
                                     direction=slot.direction.value,
                                     clue_box=slot.clue_box,
-                                    definition=entry.definition if entry else None,
+                                    definition=fetched_defs.get(word) or (entry.definition if entry else None),
                                     preset_main_clue=tw.clue,
                                 ))
                             else:
@@ -258,8 +279,23 @@ class CrosswordGenerator:
                                     word=word,
                                     direction=slot.direction.value,
                                     clue_box=slot.clue_box,
-                                    definition=entry.definition if entry else None,
+                                    definition=fetched_defs.get(word) or (entry.definition if entry else None),
                                 ))
+
+                    # Detect sibling entry pairs: slots sharing the same (row, col) start
+                    start_pos_map: Dict[Tuple[int, int], List[WordSlot]] = {}
+                    for slot in slots:
+                        start_pos_map.setdefault((slot.start_row, slot.start_col), []).append(slot)
+
+                    slot_id_to_slot: Dict[str, WordSlot] = {slot.id: slot for slot in slots}
+                    for req in clue_requests:
+                        slot = slot_id_to_slot.get(req.slot_id)
+                        if slot is None:
+                            continue
+                        siblings = start_pos_map.get((slot.start_row, slot.start_col), [])
+                        sibling = next((s for s in siblings if s.id != slot.id and s.text), None)
+                        if sibling:
+                            req.sibling_word = sibling.text
 
                     clue_texts = self.clue_generator.generate(
                         clue_requests, difficulty=self.config.difficulty,
@@ -593,19 +629,27 @@ class CrosswordGenerator:
         return changed
 
     def _ensure_all_licensed(self, grid: CrosswordGrid) -> None:
-        """Ensure every slot boundary has clue licensing.
+        """Ensure every slot boundary has clue licensing, respecting MAX_CLUES_PER_BOX.
 
-        This eagerly creates clue boxes for every slot start that doesn't
-        already have one. If a clue box can't be created for a slot start,
-        convert the start cell itself into a clue box to eliminate the
-        unlicensable slot.
+        Maintains structural license counts separately from placed-word licenses:
+        during layout no words are placed yet, so clue_box_licenses would read as
+        empty for all newly created boxes. The structural dict tracks how many slot
+        starts have been assigned to each box within this call.
         """
+        # (row, col, direction.value) → assigned clue box position
+        assigned: Dict[Tuple[int, int, str], Tuple[int, int]] = {}
+        # box position → number of slot starts assigned to it (layout-phase only)
+        structural: Dict[Tuple[int, int], int] = defaultdict(int)
+
         changed = True
         while changed:
             changed = False
             for direction in (Direction.ACROSS, Direction.DOWN):
                 for r in range(grid.bounds.rows):
                     for c in range(grid.bounds.cols):
+                        slot_key = (r, c, direction.value)
+                        if slot_key in assigned:
+                            continue
                         cell = grid.cell(r, c)
                         if not cell.is_playable():
                             continue
@@ -614,22 +658,32 @@ class CrosswordGenerator:
                         sig = self._build_signature(grid, r, c, direction)
                         if not sig or sig.length < 2:
                             continue
-                        # Check if already licensed
-                        already_licensed = False
+
+                        # Find adjacent clue box with remaining capacity
+                        licensed_by: Optional[Tuple[int, int]] = None
                         for dr, dc in grid._clue_offsets(direction):
                             nr, nc = r + dr, c + dc
-                            if grid.bounds.contains(nr, nc) and grid.cell(nr, nc).type == CellType.CLUE_BOX:
-                                already_licensed = True
-                                break
-                        if already_licensed:
+                            if not grid.bounds.contains(nr, nc):
+                                continue
+                            if grid.cell(nr, nc).type == CellType.CLUE_BOX:
+                                placed = len(grid.clue_box_licenses.get((nr, nc), set()))
+                                if placed + structural[(nr, nc)] < MAX_CLUES_PER_BOX:
+                                    licensed_by = (nr, nc)
+                                    break
+
+                        if licensed_by is not None:
+                            assigned[slot_key] = licensed_by
+                            structural[licensed_by] += 1
                             continue
-                        # Try to create a clue box at a valid offset
+
+                        # No adjacent under-capacity box — find or create one
                         try:
-                            grid.ensure_clue_box(r, c, direction)
+                            cb = grid.ensure_clue_box(r, c, direction)
+                            assigned[slot_key] = cb
+                            structural[cb] += 1
                             changed = True
                         except ClueBoxError:
-                            # Can't license this slot start. Convert the start
-                            # cell to a clue box to eliminate the unlicensable slot.
+                            # Convert start cell to clue box to eliminate the unlicensable slot
                             if cell.type == CellType.EMPTY_PLAYABLE and not cell.part_of_word_ids:
                                 try:
                                     grid._add_clue_box(r, c)
@@ -878,6 +932,9 @@ class CrosswordGenerator:
         return repaired
 
     def _assign_existing_slot_to_clue(self, grid: CrosswordGrid, clue_pos: Tuple[int, int]) -> bool:
+        target_licenses = grid.clue_box_licenses.get(clue_pos, set())
+        if len(target_licenses) >= MAX_CLUES_PER_BOX:
+            return False
         for slot in grid.word_slots.values():
             if not self._clue_can_license_slot(grid, clue_pos, slot):
                 continue

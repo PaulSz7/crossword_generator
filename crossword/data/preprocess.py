@@ -305,6 +305,27 @@ def _tag_difficulty_score(tags: str) -> float:
     return 0.0
 
 
+def _source_coverage(source_score: float, source_count: int, definition_count: int) -> float:
+    """0.0–1.0: how well-attested the word is in standard dictionaries.
+
+    High value → word is well-covered by reliable sources → pulls difficulty down.
+    Low value  → word has few or only obscure sources → lets difficulty rise.
+
+    Quality weights by source tier:
+    - common (0.0, DEX '96/'98): full weight → counts matter fully
+    - unknown (0.5, other sources): partial weight → some credit, but not enough for EASY
+    - rare/hard (≥1.0, regional/archaic dicts): zero weight → no coverage bonus
+    """
+    if source_score >= 1.0:
+        return 0.0
+    quality = 1.0 if source_score == 0.0 else 0.3
+    count_factor = (
+        0.6 * min(source_count, 5) / 5
+        + 0.4 * min(definition_count, 10) / 10
+    )
+    return quality * count_factor
+
+
 def compute_difficulty_score(
     frequency: float,
     length: int,
@@ -317,9 +338,8 @@ def compute_difficulty_score(
     """Compute a 0.0-1.0 difficulty score (higher = harder).
 
     Two-layer design:
-    - **Base score**: continuous signals (frequency, length, counts) rank words
-      within a tier. Tags and source also contribute here at lower weight since
-      the floor layer already handles tier placement.
+    - **Base score**: continuous signals (frequency, length, coverage) rank words
+      within a tier.
     - **Hard floors**: discrete markers guarantee a minimum tier regardless of
       how common or short the word is:
         - Hard tag (rar, regional, argou, …)  → floor 0.60  (hard tier)
@@ -331,18 +351,23 @@ def compute_difficulty_score(
     definitions for the word (set by ``_best_source`` during preprocessing),
     so the hard-source floor only fires for words that genuinely appear
     exclusively in specialised hard dictionaries.
+
+    Coverage term (replaces the two independent count terms):
+    ``source_count`` and ``definition_count`` are weighted by source quality so
+    that many entries in common/DEX sources strongly reduce difficulty, while
+    many entries in obscure-only sources provide little or no reduction.
     """
     tag_score = max(_tag_difficulty_score(tags), _tag_difficulty_score(def_abbrevs))
     source_score = _source_rarity_score(source_name)
     length_score = (min(length, 12) - 3) / 9
+    coverage = _source_coverage(source_score, source_count, definition_count)
 
     base = (
         0.40 * (1.0 - frequency)
         + 0.20 * length_score
         + 0.15 * tag_score
         + 0.10 * source_score
-        + 0.05 * (1.0 - min(source_count, 5) / 5)
-        + 0.05 * (1.0 - min(definition_count, 10) / 10)
+        + 0.10 * (1.0 - coverage)
     )
 
     floor = 0.0

@@ -12,9 +12,17 @@ from ..core.constants import CellType
 from ..core.models import Clue, WordSlot
 from ..utils.logger import get_logger
 from .gemini_client import GeminiClient
+from .prompt_log import PromptLog
 
 
 LOGGER = get_logger(__name__)
+
+
+def _strip_dex_markup(text: str) -> str:
+    """Strip dexonline internalRep markup (@, #, $, [...]) for clean LLM context."""
+    text = re.sub(r'\[.*?\]', '', text)   # remove pronunciation notes
+    text = re.sub(r'[@#$]', '', text)     # strip marker characters
+    return re.sub(r'  +', ' ', text).strip()
 
 
 @dataclass
@@ -26,6 +34,7 @@ class ClueRequest:
     clue_box: tuple[int, int]
     definition: Optional[str] = None          # DEX definition for LLM context
     preset_main_clue: Optional[str] = None    # user-provided clue; LLM generates hints only
+    sibling_word: Optional[str] = None        # other word sharing the same clue box (if any)
 
 
 @dataclass
@@ -36,12 +45,49 @@ class ClueBundle:
     hint_2: str
 
 
-SYSTEM_INSTRUCTION = """\
+_DIFFICULTY_CONTROL: Dict[str, str] = {
+    "EASY": (
+        "- main_clue: clear, accessible; simple one-to-one synonyms and direct definitions are allowed\n"
+        "- hint_1: a straightforward descriptive phrase that makes the answer fairly guessable\n"
+        "- hint_2: a clear, helpful explanation that most players can solve immediately\n"
+        "- Overall tone: friendly and approachable, minimal misdirection"
+    ),
+    "MEDIUM": (
+        "- main_clue: compact, indirect, but fair; prefer metaphor, wordplay, elliptical phrasing\n"
+        "- hint_1: moderately descriptive, narrows possibilities without giving the answer away\n"
+        "- hint_2: clearer guidance with enough context for most solvers\n"
+        "- Overall tone: clever but not obscure, balanced challenge"
+    ),
+    "HARD": (
+        "- main_clue: oblique, playful, and misleading while still solvable; avoid simple synonyms\n"
+        "- hint_1: subtly narrows the field but still requires lateral thinking\n"
+        "- hint_2: provides semantic guidance but through indirect or literary language\n"
+        "- Overall tone: deceptive, requires deep vocabulary or lateral thinking"
+    ),
+}
+
+_BEST_CANDIDATE_NOTE: Dict[str, str] = {
+    "EASY": "Prefer clear, accessible candidates; simple synonyms are acceptable.",
+    "MEDIUM": "Reject weak candidates such as direct definitions, simple synonyms, repetitive structures, or overly descriptive clues.",
+    "HARD": "Reject weak candidates such as direct definitions, simple synonyms, or repetitive structures. Prefer oblique, lateral-thinking angles.",
+}
+
+_DEFINITION_STYLE_RULE: Dict[str, str] = {
+    "EASY": "Dictionary-style definitions are acceptable.",
+    "MEDIUM": "Avoid dictionary-style definitions.",
+    "HARD": "Avoid dictionary-style definitions.",
+}
+
+
+_SYSTEM_INSTRUCTION_TEMPLATE = """\
 You are a professional crossword constructor specialized in compact integrame-style clues.
 
 Your task is to generate high-quality crossword clues and progressive hints for a provided list of answer words.
 
 You must follow all rules below exactly.
+
+ACTIVE DIFFICULTY: {difficulty}
+All difficulty-dependent rules and style choices in this instruction apply at the {difficulty} level.
 
 GENERAL BEHAVIOR
 - Use strictly and only the requested language.
@@ -49,6 +95,12 @@ GENERAL BEHAVIOR
 - Return only JSON matching the provided response schema.
 - Do not output explanations, reasoning, comments, markdown, or extra text.
 - Do not reveal internal analysis.
+
+{language_upper} WORDS RULE
+All answer words are {language} words from the {language} dictionary.
+Even if an answer looks identical to a word in another language, treat it EXCLUSIVELY as a {language} word.
+Never interpret an answer by its meaning in another language.
+Generate clues that reflect the word's meaning and usage in {language} only.
 
 SAFETY CHECK
 Before generating clues, inspect all provided answer words.
@@ -75,81 +127,76 @@ For every valid answer word, generate exactly three fields:
 - hint_2
 
 MAIN_CLUE REQUIREMENTS
-- Maximum 4 words
+- Maximum 4 words; strongly prefer 1–2 words
 - Extremely compact
 - Suitable for a very small crossword clue cell
-- Style varies by difficulty (see DIFFICULTY CONTROL)
 
 HINT_1 REQUIREMENTS
 - Exactly one full phrase (one sentence, no sentence-ending punctuation mid-text)
 - Slightly more descriptive than main_clue
 - Helps narrow possibilities
-- Style varies by difficulty (see DIFFICULTY CONTROL)
 
 HINT_2 REQUIREMENTS
 - Maximum 2 full phrases (one or two sentences)
 - Gives stronger semantic guidance
 - Should help most players infer the answer
-- Style varies by difficulty (see DIFFICULTY CONTROL)
 
 STRICT CLUE RESTRICTIONS
 For all clue fields:
 - Do NOT include the answer, any inflected form, derivative, obvious lexical relative, or visible substring fragment of the answer
+- Example violation: answer POLIPIER — "polipi" appears in the clue "Colonie de polipi." because "polip" is a root of "POLIPIER". This is forbidden even for inflected forms of the root.
 - Use synonyms, metaphors, contextual associations, cultural references, abbreviations, initials, letter riddles, indirect descriptions, or playful mixed meanings
-- Avoid dictionary-style definitions (except where allowed by EASY difficulty)
+- {definition_style_rule}
 - Avoid overly obvious clues
 - Avoid sensitive political, religious, hateful, sexual, or defamatory framing
 - Avoid repetitive wording or repeated clue structures across the list
-- PUNCTUATION: Use no punctuation at all unless strictly necessary. Ellipsis (...) is allowed only when intentional trailing ambiguity is needed. Exclamation mark (!) is allowed only for the short-word riddle style described above. All other punctuation — periods, commas, semicolons, colons, question marks, hyphens, dashes, parentheses, quotation marks — is forbidden.
+- PUNCTUATION: Use no punctuation at all unless strictly necessary. Ellipsis (...) is allowed only when intentional trailing ambiguity is needed. Exclamation mark (!) is allowed ONLY when the clue is a riddle, initials expansion, letter extraction, or abbreviation-logic clue. All other punctuation — periods, commas, semicolons, colons, question marks, hyphens, dashes, parentheses, quotation marks — is forbidden.
 
-SHORT WORD SPECIAL RULE
-For answers of length 2 or 3, especially abbreviations or compact entries, main_clue may use playful crossword-riddle logic such as:
-- initials
-- abbreviations
-- letter extraction
-- compact language riddles
-- playful orthographic or phrase decomposition
+RIDDLE / ABBREVIATION STYLE RULE
+main_clue may use playful crossword-riddle logic for short words. Use this style only when it fits naturally — it is a stylistic choice, never a requirement.
 
-Examples of allowed styles:
-- name initials
-- institutional abbreviations
-- playful letter riddles
+WHEN TO USE RIDDLE STYLE:
+- Only for words of {riddle_max_letters} letters or fewer (active difficulty: {difficulty})
+- Do NOT use riddle style for longer words
+- Only use it when the riddle genuinely works and is solvable — skip it if no clean riddle angle exists and provide normal difficulty-controlled clue
 
-If main_clue uses this riddle/abbreviation style, it must end with an exclamation mark.
-Be creative and do not limit yourself to the examples above.
+RIDDLE TECHNIQUES (pick one per clue):
+- Initials expansion: each letter of the answer is the first letter of a word in a name (person, celebrity, company, etc.)
+- Letter extraction (start): the answer letters open another word
+- Letter extraction (end): the answer letters close another word
+- Letter extraction (hidden): the answer letters are embedded inside another word
+- Phrase decomposition: a familiar word or phrase, read differently, yields the answer letters
+
+ROMANIAN RIDDLE EXAMPLES:
+- Answer MP → "Mihai Popescu" — M and P are the initials of this name
+- Answer EPU → "Început!" — EPU is hidden inside "ceput" (în c·e·p·u·t)
+- Answer RA → "Final de aurora!" — RA closes the word "aurora" (auro·r·a)
+- Answer CAP → "Debut de capital!" — CAP opens the word "capital"
+
+If main_clue uses this riddle/abbreviation style, it MUST end with an exclamation mark.
+If main_clue is descriptive, synonymic, or definition-style, it MUST NOT end with an exclamation mark — regardless of word length.
+Example violation: "Fruct mic!" is forbidden because "fruct mic" is a descriptive phrase, not a riddle.
+Be creative beyond the examples above. Every riddle clue must be genuinely solvable and make logical sense.
+
+FOREIGN ABBREVIATIONS
+If the answer is an abbreviation that originates from a foreign language (e.g. BC = Before Christ in English), the clue MUST acknowledge the foreign origin.
+Use a formulation in {language} that names the source language (e.g. "abbreviation from English", translated appropriately).
+Do NOT expand a foreign abbreviation as if it were a native {language} abbreviation.
 
 THEME INTEGRATION
 - When natural, connect clues subtly to the provided theme.
 - Do not force the theme if it makes the clue awkward or obvious.
 
 DIFFICULTY CONTROL
-Adjust ALL clue fields (main_clue, hint_1, hint_2) to the requested difficulty:
-
-EASY:
-- main_clue: clear, accessible; simple one-to-one synonyms and direct definitions are allowed
-- hint_1: a straightforward descriptive phrase that makes the answer fairly guessable
-- hint_2: a clear, helpful explanation that most players can solve immediately
-- Overall tone: friendly and approachable, minimal misdirection
-
-MEDIUM:
-- main_clue: compact, indirect, but fair; prefer metaphor, wordplay, elliptical phrasing
-- hint_1: moderately descriptive, narrows possibilities without giving the answer away
-- hint_2: clearer guidance with enough context for most solvers
-- Overall tone: clever but not obscure, balanced challenge
-
-HARD:
-- main_clue: oblique, playful, and misleading while still solvable; avoid simple synonyms
-- hint_1: subtly narrows the field but still requires lateral thinking
-- hint_2: provides semantic guidance but through indirect or literary language
-- Overall tone: deceptive, requires deep vocabulary or lateral thinking
+Adjust ALL clue fields (main_clue, hint_1, hint_2) to the {difficulty} level:
+{difficulty_control}
 
 INTERNAL BEST-CANDIDATE SELECTION
 For each answer:
 - Generate multiple possible main clue angles internally
 - Compare them for originality, brevity, cleverness, fairness, and non-obviousness
-- For MEDIUM and HARD: reject weak candidates such as direct definitions, simple synonyms, repetitive structures, or overly descriptive clues
-- For EASY: prefer clear, accessible candidates; simple synonyms are acceptable
-- Select the strongest candidate for the requested difficulty
+- {best_candidate_note}
+- Select the strongest candidate
 - Do not output candidates or reasoning
 
 STYLE VARIATION
@@ -164,6 +211,13 @@ Distribute different styles such as:
 - abbreviation logic
 - letter riddle
 
+SIBLING ENTRIES (same start position)
+Some pairs of entries share the same starting cell and therefore the same clue box.
+For each such pair the prompt lists: PRIMARY: X   SIBLING: Y
+The PRIMARY entry's main_clue must work as a useful hint for BOTH words simultaneously.
+Ideal shared clues name a common category, concept, or wordplay angle that applies to both answers (e.g. "Simbol feminin" works for both EA and EVA).
+The SIBLING entry receives its own independent clue as normal — only the PRIMARY's main_clue must serve double duty.
+
 SELF-VALIDATION
 Before returning the final response, verify internally that:
 - every answer has exactly one main_clue, one hint_1, and one hint_2
@@ -173,18 +227,58 @@ Before returning the final response, verify internally that:
 - no clue contains the answer
 - no clue contains any inflected form, derivative, obvious lexical relative, or visible substring fragment of the answer
 - all clue text is strictly in the requested language
-- clue style matches the requested difficulty level
+- every clue matches the grammatical form of its answer (number, gender, verb form)
+- clue style strictly matches {difficulty} guidelines
 - clue wording is not duplicated excessively across entries
-- no clue field uses punctuation unless strictly necessary (ellipsis only for intentional ambiguity, exclamation mark only for the riddle style)
+- exclamation mark (!) is ONLY used when the clue is a genuine riddle, initials expansion, letter extraction, or abbreviation-logic clue — never for descriptive or synonymic clues
+- riddle style is only used for words of ≤ {riddle_max_letters} letters (active difficulty: {difficulty}), and only when the riddle genuinely works
+- no other punctuation is used unless strictly necessary (ellipsis only for intentional ambiguity)
 - the response matches the required JSON schema
 
 If any rule fails, revise internally until the output is valid.
 
+GRAMMATICAL AGREEMENT (applies to every word, with or without a definition)
+Every clue must match the exact grammatical form of the answer word as it appears in the crossword:
+- If the answer is plural, the clue must be plural.
+- If the answer is singular, the clue must be singular.
+- Respect gender (masculine / feminine / neuter) in the clue phrasing.
+- Respect verb form if the answer is a verb (infinitive, conjugated form, etc.).
+Use your knowledge of {language} to determine the correct grammatical form of every answer word.
+
 DEFINITIONS (provided for some words)
-Use the provided definition as contextual background only. Do NOT reproduce it verbatim. The word may have other meanings — generate clues freely from any angle.
+When a definition is available, use it as a semantic anchor to confirm the exact meaning and grammatical form of the word — but do NOT reproduce it verbatim.
+Definitions may contain part-of-speech markers — use them to identify the word's grammatical category:
+- s. m. / s. f. / s. n. = noun (masculine / feminine / neuter)
+- vb. / v. = verb
+- adj. = adjective
+- adv. = adverb
+- interj. = interjection
+- prep. = preposition
+These markers help confirm the form inferred from the word itself. When a definition is not provided, rely solely on your knowledge of {language}.
 
 PRESET MAIN CLUES
 For words marked with a preset_main_clue, echo that value exactly in the `main_clue` field. Generate only `hint_1` and `hint_2` for these words."""
+
+
+def _build_system_instruction(language: str, difficulty: str = "MEDIUM") -> str:
+    """Return the system instruction with language- and difficulty-specific sections filled in."""
+    diff_upper = (difficulty or "MEDIUM").upper()
+    riddle_max_letters = 4 if diff_upper == "HARD" else 3
+    extra_riddle_example = (
+        "\n- Answer LUNA → \"Deschide 'lunatic'!\" — LUNA opens the word \"lunatic\""
+        if riddle_max_letters >= 4 else ""
+    )
+    return _SYSTEM_INSTRUCTION_TEMPLATE.format(
+        language=language,
+        language_upper=language.upper(),
+        difficulty=diff_upper,
+        riddle_max_letters=riddle_max_letters,
+        extra_riddle_example=extra_riddle_example,
+        difficulty_control=_DIFFICULTY_CONTROL[diff_upper],
+        best_candidate_note=_BEST_CANDIDATE_NOTE[diff_upper],
+        definition_style_rule=_DEFINITION_STYLE_RULE[diff_upper],
+    )
+
 
 MAIN_PROMPT_TEMPLATE = """\
 Generate crossword clues for all provided words.
@@ -196,8 +290,7 @@ DIFFICULTY: {{DIFFICULTY}}
 WORD LIST (JSON array):
 {{WORD_LIST_JSON}}
 
-{{DEFINITIONS_SECTION}}{{PRESET_CLUES_SECTION}}
-Requirements:
+{{DEFINITIONS_SECTION}}{{PRESET_CLUES_SECTION}}{{SIBLING_ENTRIES_SECTION}}Requirements:
 - Return one clue object for each input word.
 - Preserve the original answer exactly in the "answer" field.
 - Keep the same order as the input list.
@@ -258,6 +351,7 @@ class GeminiClueGenerator:
         api_key_env: str = "GEMINI_API_KEY",
         model_env: str = "GEMINI_MODEL",
         gemini_client: GeminiClient | None = None,
+        prompt_log: PromptLog | None = None,
     ) -> None:
         """Initialize with optional pre-built client."""
         resolved_model = os.environ.get(model_env, model_name)
@@ -265,6 +359,7 @@ class GeminiClueGenerator:
         self.api_key_env = api_key_env
         self.model_env = model_env
         self._client = gemini_client
+        self._prompt_log = prompt_log
 
     def _get_client(self) -> GeminiClient:
         """Return the cached client or create a new one."""
@@ -273,6 +368,7 @@ class GeminiClueGenerator:
                 model_name=self.model_name,
                 api_key_env=self.api_key_env,
                 model_env=self.model_env,
+                prompt_log=self._prompt_log,
             )
         return self._client
 
@@ -291,12 +387,14 @@ class GeminiClueGenerator:
 
         word_list = list(answer_to_slots.keys())
         prompt = self._render_prompt(word_list, difficulty, language, theme, requests)
+        system_instruction = _build_system_instruction(language, difficulty)
 
         client = self._get_client()
         response_text = client.generate_text(
             prompt,
-            system_instruction=SYSTEM_INSTRUCTION,
+            system_instruction=system_instruction,
             response_schema=CLUE_RESPONSE_SCHEMA,
+            request_type="clue_generation",
         )
 
         parsed = self._parse_response(response_text)
@@ -318,8 +416,9 @@ class GeminiClueGenerator:
             repair_prompt = _build_repair_prompt(needs_repair, language, theme, difficulty)
             repair_text = client.generate_text(
                 repair_prompt,
-                system_instruction=SYSTEM_INSTRUCTION,
+                system_instruction=system_instruction,
                 response_schema=CLUE_RESPONSE_SCHEMA,
+                request_type="clue_repair",
             )
             repaired = self._parse_response(repair_text)
             if repaired is not None:
@@ -364,7 +463,8 @@ class GeminiClueGenerator:
         preset_clues_section = ""
 
         if requests:
-            defs = [(req.word.upper(), req.definition) for req in requests if req.definition]
+            defs = [(req.word.upper(), _strip_dex_markup(req.definition))
+                    for req in requests if req.definition]
             if defs:
                 lines = ["WORD DEFINITIONS (reference context only — do not copy verbatim):"]
                 for word, defn in defs:
@@ -378,6 +478,45 @@ class GeminiClueGenerator:
                     lines.append(f"{word}: {preset}")
                 preset_clues_section = "\n".join(lines) + "\n\n"
 
+        sibling_section = ""
+        if requests:
+            # Build direction lookup for primary/sibling designation
+            word_to_direction = {req.word.upper(): req.direction for req in requests}
+
+            seen_pairs: set = set()
+            sibling_lines: list = []
+            for req in requests:
+                if not req.sibling_word:
+                    continue
+                word, sib = req.word.upper(), req.sibling_word.upper()
+                pair_key = frozenset((word, sib))
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+
+                # Primary = ACROSS entry (displayed first in the shared box);
+                # fall back to alphabetical order when both have the same direction.
+                w_dir = word_to_direction.get(word, "")
+                s_dir = word_to_direction.get(sib, "")
+                if w_dir == "ACROSS" and s_dir != "ACROSS":
+                    primary, secondary = word, sib
+                elif s_dir == "ACROSS" and w_dir != "ACROSS":
+                    primary, secondary = sib, word
+                else:
+                    primary, secondary = sorted([word, sib])
+
+                sibling_lines.append(
+                    f"  PRIMARY: {primary}   SIBLING: {secondary}"
+                    f"  (write {primary}'s main_clue so it works as a hint for both words)"
+                )
+
+            if sibling_lines:
+                sibling_section = (
+                    "SIBLING ENTRIES (same start position — shared clue box):\n"
+                    + "\n".join(sibling_lines)
+                    + "\n\n"
+                )
+
         return (
             MAIN_PROMPT_TEMPLATE
             .replace("{{LANGUAGE}}", language)
@@ -386,6 +525,7 @@ class GeminiClueGenerator:
             .replace("{{WORD_LIST_JSON}}", word_list_json)
             .replace("{{DEFINITIONS_SECTION}}", definitions_section)
             .replace("{{PRESET_CLUES_SECTION}}", preset_clues_section)
+            .replace("{{SIBLING_ENTRIES_SECTION}}", sibling_section)
         )
 
     @staticmethod
@@ -422,7 +562,7 @@ def _count_sentences(text: str) -> int:
 
 def _is_severe_clue_violation(violation: str) -> bool:
     """Return True for violations that require a repair call (vs cosmetic issues that are accepted)."""
-    severe_keywords = ("missing required", "unexpected answer", "contains the answer")
+    severe_keywords = ("missing required", "unexpected answer", "contains the answer", "contains answer fragment")
     return any(kw in violation for kw in severe_keywords)
 
 
@@ -465,10 +605,31 @@ def _validate_clues(
             all_violations.append(f"hint_2 exceeds 2 phrases ({hint_2_sentences} sentences)")
 
         answer_lower = answer.lower()
+        # Riddle-style main_clue (ends with !) intentionally contains answer letters — skip checks for it.
+        is_riddle = main_clue.rstrip().endswith("!")
+        clue_fields = [("main_clue", main_clue), ("hint_1", hint_1), ("hint_2", hint_2)]
+
         if answer_lower and len(answer_lower) >= 2:
-            for field_name, field_val in [("main_clue", main_clue), ("hint_1", hint_1), ("hint_2", hint_2)]:
-                if answer_lower in field_val.lower():
+            for field_name, field_val in clue_fields:
+                # Use word-boundary matching: ignore the answer appearing as part of an unrelated word.
+                # Riddle clues (main_clue ending with !) are NOT exempt here — the clue must not
+                # literally spell out the answer as a standalone word even in riddle style.
+                if re.search(r'\b' + re.escape(answer_lower) + r'\b', field_val.lower()):
                     all_violations.append(f"{field_name} contains the answer '{answer}'")
+
+        # Check for long substrings of the answer appearing as standalone words in any clue field
+        # (catches derivative forms like "polipi" for POLIPIER, but not coincidental embeddings)
+        if answer_lower and len(answer_lower) >= 6:
+            for sub_len in range(5, len(answer_lower)):
+                for start in range(len(answer_lower) - sub_len + 1):
+                    substr = answer_lower[start:start + sub_len]
+                    for field_name, field_val in clue_fields:
+                        if field_name == "main_clue" and is_riddle:
+                            continue
+                        if re.search(r'\b' + re.escape(substr) + r'\b', field_val.lower()):
+                            all_violations.append(
+                                f"{field_name} contains answer fragment '{substr}' (from '{answer}')"
+                            )
 
         if not all_violations:
             valid.append(entry)

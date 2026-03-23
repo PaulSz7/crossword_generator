@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence,
 
 from ..core.constants import Difficulty
 from ..io.gemini_client import GeminiClient
+from ..io.prompt_log import PromptLog
 from ..utils.logger import get_logger
 
 if TYPE_CHECKING:
@@ -110,7 +111,7 @@ CLUE FIELD REQUIREMENTS
 For every word, generate exactly three fields: clue, long_clue, hint.
 
 CLUE (ultra-short clue)
-- Maximum 3 words
+- Maximum 3 words; strongly prefer 1–2 words
 - Extremely compact — suitable for a tiny crossword clue cell
 - Style varies by difficulty (see DIFFICULTY CONTROL)
 
@@ -413,6 +414,7 @@ class GeminiThemeWordGenerator:
         theme_description: str = "",
         cache: Optional["ThemeCache"] = None,
         gemini_client: Optional[GeminiClient] = None,
+        prompt_log: Optional[PromptLog] = None,
     ) -> None:
         """Initialize with optional pre-built client and cache."""
         resolved_model = os.environ.get(model_env, model_name)
@@ -423,6 +425,7 @@ class GeminiThemeWordGenerator:
         self.theme_description = theme_description
         self.cache = cache
         self._client = gemini_client
+        self._prompt_log = prompt_log
 
     def _get_client(self) -> GeminiClient:
         """Return the cached client or create a new one."""
@@ -431,6 +434,7 @@ class GeminiThemeWordGenerator:
                 model_name=self.model_name,
                 api_key_env=self.api_key_env,
                 model_env=self.model_env,
+                prompt_log=self._prompt_log,
             )
         return self._client
 
@@ -460,6 +464,7 @@ class GeminiThemeWordGenerator:
             prompt,
             system_instruction=THEME_SYSTEM_INSTRUCTION,
             response_schema=response_schema,
+            request_type="theme_generation",
         )
 
         parsed = self._parse_response(response_text, self.theme_type)
@@ -486,6 +491,7 @@ class GeminiThemeWordGenerator:
                 repair_prompt,
                 system_instruction=THEME_SYSTEM_INSTRUCTION,
                 response_schema=repair_schema,
+                request_type="theme_repair",
             )
             repaired = self._parse_response(repair_text, self.theme_type)
             if repaired is not None:

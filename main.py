@@ -8,10 +8,14 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List
 
+from crossword.data.definition_store import DefinitionStore
 from crossword.data.theme import ThemeType
 from crossword.data.theme_cache import ThemeCache
 from crossword.engine.crossword_store import CrosswordStore
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig
+from crossword.io.definition_fetcher import GeminiDefinitionFetcher
+from crossword.io.gemini_client import GeminiClient
+from crossword.io.prompt_log import PromptLog
 from crossword.utils.logger import configure_logging
 
 
@@ -200,6 +204,10 @@ def main(argv: list[str] | None = None) -> None:
     # Initialise persistent stores
     theme_cache = ThemeCache()
     crossword_store = CrosswordStore()
+    prompt_log = PromptLog()
+    definition_store = DefinitionStore()
+    gemini_client = GeminiClient(prompt_log=prompt_log)
+    dex_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
 
     # Wire up generators based on mode
     theme_gen = None
@@ -235,6 +243,7 @@ def main(argv: list[str] | None = None) -> None:
                 theme_type=theme_type,
                 theme_description=args.theme_description,
                 cache=theme_cache,
+                prompt_log=prompt_log,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -256,14 +265,23 @@ def main(argv: list[str] | None = None) -> None:
                         theme_type=theme_type,
                         theme_description=args.theme_description,
                         cache=theme_cache,
+                        prompt_log=prompt_log,
                     ),
                     DummyThemeWordGenerator(seed=config.seed),
                 ]
             else:
                 fallbacks = []
+        elif args.llm:
+            theme_gen = GeminiThemeWordGenerator(
+                theme_type=theme_type,
+                theme_description=args.theme_description,
+                cache=theme_cache,
+                prompt_log=prompt_log,
+            )
+            fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
         # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
 
-    clue_gen = GeminiClueGenerator() if args.clues else None
+    clue_gen = GeminiClueGenerator(prompt_log=prompt_log) if args.clues else None
 
     generator = CrosswordGenerator(
         config,
@@ -272,6 +290,7 @@ def main(argv: list[str] | None = None) -> None:
         clue_generator=clue_gen,
         store=crossword_store,
         theme_cache=theme_cache,
+        dex_fetcher=dex_fetcher,
     )
     result = generator.generate()
 

@@ -8,7 +8,7 @@ from typing import List, Optional, Set
 from ..core.constants import CellType, Direction, ORTHOGONAL_STEPS
 from ..data.dictionary import WordDictionary
 from ..core.exceptions import ValidationError
-from .grid import CrosswordGrid
+from .grid import CrosswordGrid, MAX_CLUES_PER_BOX
 from ..utils.logger import get_logger
 
 
@@ -49,6 +49,10 @@ class GridValidator:
                 continue
             if not licenses:
                 raise ValidationError(f"Clue box at {(row, col)} does not license any word")
+            if len(licenses) > MAX_CLUES_PER_BOX:
+                raise ValidationError(
+                    f"Clue box at {(row, col)} licenses {len(licenses)} words (max {MAX_CLUES_PER_BOX})"
+                )
             for dr, dc in ORTHOGONAL_STEPS:
                 nr, nc = row + dr, col + dc
                 if not grid.bounds.contains(nr, nc):

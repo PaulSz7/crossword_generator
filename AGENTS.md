@@ -66,6 +66,7 @@ Agents must not violate these rules:
      - word going DOWN: above / left / right (❌ not bottom)
    - Every clue box must license at least one word start (across/down) of length ≥2.
    - All across and down letter sequences of length ≥2 must have an adjacent `CLUE_BOX` to the first letter cell.
+   - **A single clue box may license at most `MAX_CLUES_PER_BOX` (3) word slots.** This is a hard constraint enforced during layout generation (not just validation). The layout phase maintains a structural license counter separate from placed-word licenses so that multiple unlicensed slots cannot all be assigned to the same box in the same pass.
 
 4. **Validity**
    - All rules above +
@@ -142,9 +143,13 @@ def fill_crossword(grid):
    - **Gemini theme words**: clue/long_clue/hint from the theme generation phase are used directly — no LLM call.
    - **All other words** (fill words, user words without a clue, substring/dummy theme words): sent to `GeminiClueGenerator` for full generation of `main_clue`, `hint_1`, and `hint_2`.
    - **User words with an explicit clue** (`WORD:clue` syntax): the user-supplied text is used as `main_clue` unchanged; the LLM generates only `hint_1` and `hint_2`.
-2. Fill word requests include the word’s DEX definition as reference context so the LLM can produce informed clues for uncommon words.
-3. All clue text must use no punctuation except ellipsis (`...`) for intentional ambiguity or exclamation mark (`!`) for the short-word riddle style.
-4. Generated clues are applied to the clue cell objects via `attach_clues_to_grid`.
+2. Fill word requests include the word’s DEX definition as reference context (fetched via `GeminiDefinitionFetcher` / `DefinitionStore` before the clue prompt is built) so the LLM can produce informed clues for uncommon words. The generator logs an INFO message listing all words sent to DEX lookup.
+3. **Grammatical agreement is a universal requirement** (applies to all words, regardless of whether a DEX definition is provided): the generated clue must match the answer’s number (singular/plural), gender, and any other relevant grammatical form in Romanian. If a definition is provided, part-of-speech markers within it are useful signals for detecting the correct form; the LLM must still apply grammatical agreement even when no definition is available.
+4. **Clue length**: `main_clue` may contain at most 4 words; strongly prefer 1–2 words. Theme-phase clue fields follow the same rule (max 3 words, strongly prefer 1–2).
+5. All clue text must use no punctuation except ellipsis (`...`) for intentional ambiguity or exclamation mark (`!`) for the short-word riddle style.
+6. **Riddle clue validation**: a `main_clue` ending with `!` may embed the answer letters inside other words (e.g. `"Început!"` = EPU because "ceput" contains "epu"). Such clues are exempt from the fragment/substring answer-reveal check, but the exact-answer word-boundary check is still enforced (the clue must not literally spell out the full answer as a standalone word).
+7. Generated clues are applied to the clue cell objects via `attach_clues_to_grid`.
+8. All LLM prompts and responses are persisted to `local_db/collections/prompt_log/{request_type}/` via `PromptLog` for debugging and auditing. Subcollections: `clue_generation`, `clue_repair`, `theme_generation`, `theme_repair`, `definition_fetch`.
 
 **IV. General Advice:**
 1. Provide meaningful logging and debugging messages at each step for better initial development.
@@ -199,15 +204,18 @@ Must NOT:
 Responsibilities:
 - Generate Romanian clues (cryptic & straight) for fill words and non-Gemini theme words
 - Preserve user-provided `main_clue` values exactly; generate only hints for these words
-- Pass DEX definitions as reference context for uncommon fill words
+- Fetch DEX definitions via `GeminiDefinitionFetcher` before building clue prompts; pass definitions as reference context
+- Enforce grammatical agreement in all generated clues (universal — not only for words with definitions)
 - Ensure multiple clues per clue box are supported
-- Validate clue–answer consistency
+- Validate clue–answer consistency; riddle clues (`!`) are exempt from fragment/substring checks but not from exact-answer word-boundary checks
+- Log all LLM calls to `PromptLog` partitioned by request type
 
 Constraints:
 - No grid modification
 - No letter changes
 - Must not overwrite Gemini-generated theme clues — those bypass the LLM entirely
 - No punctuation in clue text except `...` (intentional ambiguity) or `!` (riddle style)
+- `main_clue` max 4 words (strongly prefer 1–2)
 
 ---
 
@@ -236,6 +244,21 @@ Recommended logging levels:
 - `DEBUG`: slot rejection reasons
 - `WARNING`: near-failure recoveries
 - `ERROR`: rule violations
+
+---
+
+## 🗄️ Persistent Stores (`local_db/collections/`)
+
+| Store | Class | Path | Contents |
+|---|---|---|---|
+| `crosswords/` | `CrosswordStore` | `crossword/engine/crossword_store.py` | One JSON doc per generation attempt; success docs include clues + stats, failure docs include partial grid state |
+| `llm_theme_cache/` | `ThemeCache` | `crossword/data/theme_cache.py` | LLM theme generation output, keyed by theme title + type; used for lookup/merge in `DOMAIN_SPECIFIC_WORDS` mode |
+| `definitions/` | `DefinitionStore` | `crossword/data/definition_store.py` | DEX definitions fetched via Gemini grounded search, persisted to avoid redundant API calls |
+| `prompt_log/` | `PromptLog` | `crossword/io/prompt_log.py` | All Gemini prompts + responses, partitioned into subcollection folders by `request_type` |
+
+`PromptLog` subcollections: `clue_generation/`, `clue_repair/`, `theme_generation/`, `theme_repair/`, `definition_fetch/`.
+
+`GeminiClient` writes to `PromptLog` automatically after every successful LLM call; system instructions are **not** stored (they are stable per request type and derivable from the source).
 
 ---
 

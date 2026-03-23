@@ -123,13 +123,28 @@ After CP-SAT fill, clues are assigned per word based on its origin:
 | Substring / dummy theme word | LLM generates all three fields |
 | Fill word (non-theme) | LLM generates all three fields; DEX definition passed as reference context |
 
-Fill word requests include the word's DEX definition so the LLM can generate
-informed clues for uncommon words without being constrained to reproduce the
-definition verbatim.
+Before sending words to the clue LLM, the generator looks up DEX definitions for
+fill words that have no cached definition. Definitions are fetched in batch via
+`GeminiDefinitionFetcher` (grounded Gemini search) and cached in
+`local_db/collections/definitions/` by `DefinitionStore`. An INFO log line lists
+all words sent for lookup.
+
+**Grammatical agreement** is a universal requirement: every generated clue must
+match the answer word's grammatical form (number, gender, case) in Romanian. When
+a DEX definition is provided, part-of-speech markers inside it are useful signals;
+the rule applies equally to words without a definition.
+
+**Clue length**: `main_clue` may contain at most 4 words; 1–2 words strongly preferred.
 
 All generated clue text must contain no punctuation other than ellipsis (`...`)
 where intentional trailing ambiguity is needed, or exclamation mark (`!`) for
-the short-word riddle style.
+the short-word riddle style. Riddle clues (ending with `!`) may embed the answer
+letters inside other words and are exempt from the fragment/substring reveal check,
+but the exact-answer standalone-word check is always enforced.
+
+All LLM prompts and responses are logged to `local_db/collections/prompt_log/`
+partitioned by request type (`clue_generation`, `clue_repair`, `theme_generation`,
+`theme_repair`, `definition_fetch`).
 
 The fallback chain for each mode:
 
@@ -273,7 +288,7 @@ under 4 minutes total.
    - Avoids 3-letter slots (only 779 dictionary words)
    - Targets 4-8 letter slots (3K-48K dictionary candidates)
    - Penalty scoring avoids creating 3-letter remainders
-3. **Ensure licensing**: Every slot boundary gets a licensing clue box
+3. **Ensure licensing**: Every slot boundary gets a licensing clue box; each clue box may license at most **3 word slots** (`MAX_CLUES_PER_BOX`). A structural license counter tracks layout-phase assignments (separate from placed-word licenses which are empty during layout) to prevent over-assignment within a single pass.
 4. **Verify feasibility**: All ≥3-letter slots have dictionary candidates
 
 ### Phase 2: CP-SAT Filling (`_cpsat_fill`)
@@ -296,13 +311,17 @@ under 4 minutes total.
 ## Project Layout
 
 - `crossword/core/` – Cell constants, dataclasses, and exceptions
-- `crossword/data/` – Dictionary ingestion and theme-word providers
-- `crossword/engine/` – Grid manager, **generator.py** (layout), **solver.py** (CP-SAT)
-- `crossword/io/` – Clue formatting helpers
+- `crossword/data/` – Dictionary ingestion, theme-word providers, `DefinitionStore`
+- `crossword/engine/` – Grid manager, **generator.py** (layout), **solver.py** (CP-SAT), `CrosswordStore`
+- `crossword/io/` – Clue formatting helpers, `GeminiDefinitionFetcher`, `PromptLog`
 - `crossword/utils/` – Logging and utilities
 - `main.py` – Top-level CLI entrypoint
 - `debug_main.py` – Fast debug helper with auto-retry
 - `local_db/dex_words.tsv` – Romanian lexicon used during filling
+- `local_db/collections/crosswords/` – Persisted generation results
+- `local_db/collections/llm_theme_cache/` – Cached LLM theme generation output
+- `local_db/collections/definitions/` – Cached DEX definitions (via `DefinitionStore`)
+- `local_db/collections/prompt_log/` – All LLM prompts + responses, partitioned by request type
 
 ## Development
 

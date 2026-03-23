@@ -27,7 +27,7 @@ Both `GeminiClueGenerator` and `GeminiThemeWordGenerator` were upgraded to a uni
 ### Clue Field Constraints
 | Field | Constraint |
 |---|---|
-| `main_clue` | max 4 words |
+| `main_clue` | max 4 words; strongly prefer 1–2 words |
 | `hint_1` | exactly 1 sentence |
 | `hint_2` | max 2 sentences |
 
@@ -43,7 +43,8 @@ Both `GeminiClueGenerator` and `GeminiThemeWordGenerator` were upgraded to a uni
 - `main_clue` ≤ 4 words
 - `hint_1` = 1 sentence
 - `hint_2` ≤ 2 sentences
-- No field contains the answer (case-insensitive substring)
+- **Exact-answer check** (all fields including riddle clues): no field may contain the answer as a standalone word — uses `re.search(r'\b<answer>\b', ...)` (word-boundary matching) to avoid false positives from the answer appearing as a substring of an unrelated word.
+- **Fragment/substring check** (non-riddle clues only): for answers ≥ 6 chars, no field may contain a long substrings of the answer as a standalone word. Riddle `main_clue` (ending with `!`) is **exempt** from this check because riddle style intentionally embeds answer letters inside other words (e.g. `"Început!"` = EPU where `ceput` contains `epu`). The exact-answer word-boundary check still applies to riddle clues.
 - `answer` in expected word set
 
 ### Repair Loop
@@ -103,7 +104,7 @@ All clue fields must contain no punctuation other than ellipsis (`...`, for inte
 ### Theme Word Field Constraints (aligned with clue generator)
 | Field | Constraint |
 |---|---|
-| `clue` | max 3 words (ultra-short for clue cell) |
+| `clue` | max 3 words; strongly prefer 1–2 words (ultra-short for clue cell) |
 | `long_clue` | exactly 1 sentence |
 | `hint` | max 2 sentences |
 
@@ -121,7 +122,7 @@ All clue fields must contain no punctuation other than ellipsis (`...`, for inte
 - `clue` ≤ 3 words
 - `long_clue` = 1 sentence
 - `hint` ≤ 2 sentences
-- No field contains the answer (case-insensitive substring)
+- No field contains the answer as a standalone word (word-boundary matching, same rules as clue validator)
 
 ### Repair Loop
 Same pattern as clue generator:
@@ -151,6 +152,29 @@ Same pattern as clue generator:
 - **`_count_sentences(text)`**: splits on `.!?` followed by whitespace or end-of-string, counts non-empty segments. Used by both `_validate_clues` and `_validate_theme_words`. Defined in both `clues.py` and `theme.py`.
 
 ---
+
+---
+
+## Additions (post-initial implementation)
+
+### PromptLog (`crossword/io/prompt_log.py`)
+All LLM calls are persisted for debugging. `GeminiClient` accepts an optional `prompt_log: PromptLog` and calls `prompt_log.record(request_type, prompt, response)` after every successful generation. System instructions are **not** stored (stable per type). Subcollection folders under `local_db/collections/prompt_log/`:
+
+| Subcollection | Source |
+|---|---|
+| `clue_generation/` | `GeminiClueGenerator.generate()` |
+| `clue_repair/` | `GeminiClueGenerator` repair loop |
+| `theme_generation/` | `GeminiThemeWordGenerator.generate()` |
+| `theme_repair/` | `GeminiThemeWordGenerator` repair loop |
+| `definition_fetch/` | `GeminiDefinitionFetcher` |
+
+Both `GeminiClueGenerator` and `GeminiThemeWordGenerator` accept `prompt_log: Optional[PromptLog] = None` and forward it to their lazy `GeminiClient` instances.
+
+### GeminiDefinitionFetcher + DefinitionStore
+Before building the clue prompt, `generator.py` identifies fill words without a cached definition and calls `GeminiDefinitionFetcher.fetch_batch()` to retrieve DEX definitions via grounded Gemini search. Results are cached in `local_db/collections/definitions/` via `DefinitionStore`. An INFO log line lists all words sent for lookup. The `generator` logs: `"Fetching definitions for N word(s) via DEX: WORD1, WORD2, ..."`.
+
+### Grammatical Agreement (universal rule)
+Grammatical agreement is now a **universal clue requirement** — no longer conditional on having a DEX definition. Every generated clue must match the answer's grammatical form (number, gender, case) in Romanian. The DEFINITIONS section in the system instruction notes that part-of-speech markers within definitions are useful signals; the rule applies equally to words without a definition.
 
 ## Files Changed
 | File | Changes |

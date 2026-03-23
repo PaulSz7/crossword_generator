@@ -64,6 +64,7 @@ class CrosswordStore:
             "seed": result.seed,
             "grid": self._encode_grid_string(result.grid),
             "entries": self._build_entries(result.grid, result.slots),
+            "blocker_zone": list(result.grid.blocker_zone) if result.grid.blocker_zone else None,
             "stats": self._compute_compact_stats(result.slots, dictionary),
             "theme_cache_ref": theme_cache_ref,
         }
@@ -153,6 +154,7 @@ class CrosswordStore:
                 "id": slot.id,
                 "r": slot.start_row,
                 "c": slot.start_col,
+                "cb": list(slot.clue_box),
                 "dir": dir_char,
                 "len": slot.length,
                 "answer": slot.text,

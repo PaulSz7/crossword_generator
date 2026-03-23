@@ -28,10 +28,14 @@ from crossword.core.exceptions import CrosswordError, ThemeWordError
 from crossword.engine.generator import CrosswordGenerator, GeneratorConfig, CrosswordResult
 from crossword.engine.grid import CrosswordGrid
 from crossword.engine.crossword_store import CrosswordStore
+from crossword.data.definition_store import DefinitionStore
 from crossword.data.preprocess import ensure_processed_dictionary
 from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator, ThemeType
 from crossword.data.theme_cache import ThemeCache
 from crossword.io.clues import ClueRequest, GeminiClueGenerator, attach_clues_to_grid
+from crossword.io.definition_fetcher import GeminiDefinitionFetcher
+from crossword.io.gemini_client import GeminiClient
+from crossword.io.prompt_log import PromptLog
 from crossword.utils.logger import configure_logging
 from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
 
@@ -131,6 +135,10 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
     # Initialise persistent stores
     theme_cache = ThemeCache()
     crossword_store = CrosswordStore()
+    prompt_log = PromptLog()
+    definition_store = DefinitionStore()
+    gemini_client = GeminiClient(prompt_log=prompt_log)
+    dex_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
 
     # Wire up theme generators (same logic as main.py)
     theme_gen = None
@@ -141,21 +149,58 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
             theme_gen = UserWordListGenerator(user_words)
         # theme_gen=None when no user words → SubstringGen becomes primary in _seed_theme_words
         fallbacks = []  # no LLM/dummy fallbacks; extension controlled by extend_with_substring flag
-    elif user_words:
-        theme_gen = UserWordListGenerator(user_words)
-        if use_llm:
+
+    elif theme_type in ("joke_continuation", "custom"):
+        if user_words and not use_llm:
+            theme_gen = UserWordListGenerator(user_words)
+            fallbacks = []
+        elif user_words and use_llm:
+            theme_gen = UserWordListGenerator(user_words)
             fallbacks = [
                 GeminiThemeWordGenerator(
                     theme_type=theme_type,
                     theme_description=theme_description,
                     cache=theme_cache,
+                    prompt_log=prompt_log,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
         else:
-            fallbacks = []
+            theme_gen = GeminiThemeWordGenerator(
+                theme_type=theme_type,
+                theme_description=theme_description,
+                cache=theme_cache,
+                prompt_log=prompt_log,
+            )
+            fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
-    clue_gen = GeminiClueGenerator() if bool(args.get("clues", False)) else None
+    else:
+        # domain_specific_words (default)
+        if user_words:
+            theme_gen = UserWordListGenerator(user_words)
+            if use_llm:
+                fallbacks = [
+                    GeminiThemeWordGenerator(
+                        theme_type=theme_type,
+                        theme_description=theme_description,
+                        cache=theme_cache,
+                        prompt_log=prompt_log,
+                    ),
+                    DummyThemeWordGenerator(seed=config.seed),
+                ]
+            else:
+                fallbacks = []
+        elif use_llm:
+            theme_gen = GeminiThemeWordGenerator(
+                theme_type=theme_type,
+                theme_description=theme_description,
+                cache=theme_cache,
+                prompt_log=prompt_log,
+            )
+            fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
+        # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
+
+    clue_gen = GeminiClueGenerator(prompt_log=prompt_log) if bool(args.get("clues", False)) else None
 
     generator = CrosswordGenerator(
         config,
@@ -164,6 +209,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         clue_generator=clue_gen,
         store=crossword_store,
         theme_cache=theme_cache,
+        dex_fetcher=dex_fetcher,
     )
     grid_seed = generator.rng.randint(0, 1_000_000)
     grid = CrosswordGrid(config.to_grid_config(seed_override=grid_seed))
@@ -248,24 +294,50 @@ def step_validate(state: Dict[str, Any]):
 
 
 def step_clues(state: Dict[str, Any]):
+    from crossword.io.definition_fetcher import is_incomplete_definition
+
+    generator: CrosswordGenerator = state["generator"]
     state["slots"] = list(state["grid"].word_slots.values())
-    requests: List[ClueRequest] = [
-        ClueRequest(
+    slots = state["slots"]
+
+    # Fetch definitions for words missing or with truncated local definitions
+    words_needing_def = [
+        slot.text for slot in slots
+        if slot.text and (
+            (e := generator.dictionary.get(slot.text)) is None
+            or is_incomplete_definition(e.definition or "")
+        )
+    ]
+    fetched_defs: Dict[str, str] = {}
+    if words_needing_def and generator.definition_fetcher:
+        LOGGER.info(
+            "Fetching definitions for %d word(s): %s",
+            len(words_needing_def),
+            ", ".join(words_needing_def),
+        )
+        fetched_defs = generator.definition_fetcher.fetch_batch(words_needing_def)
+
+    requests: List[ClueRequest] = []
+    for slot in slots:
+        word = slot.text or ""
+        entry = generator.dictionary.get(word)
+        requests.append(ClueRequest(
             slot_id=slot.id,
-            word=slot.text or "",
+            word=word,
             direction=slot.direction.value,
             clue_box=slot.clue_box,
-        )
-        for slot in state["slots"]
-    ]
-    config = state["generator"].config
-    state["clue_texts"] = state["generator"].clue_generator.generate(
+            definition=fetched_defs.get(word) or (entry.definition if entry else None),
+        ))
+
+    config = generator.config
+    state["clue_texts"] = generator.clue_generator.generate(
         requests,
         difficulty=config.difficulty,
         language=config.language,
         theme=config.theme_title or "",
+        allow_adult=config.allow_adult,
     )
-    attach_clues_to_grid(state["grid"], state["slots"], state["clue_texts"])
+    attach_clues_to_grid(state["grid"], slots, state["clue_texts"])
     return state["clue_texts"]
 
 

@@ -15,6 +15,8 @@ from ..core.models import Cell, WordSlot
 
 LOGGER = get_logger(__name__)
 
+MAX_CLUES_PER_BOX = 3  # Hard limit: no clue cell may license more than this many word slots
+
 
 @dataclass
 class GridConfig:
@@ -461,6 +463,8 @@ class CrosswordGrid:
             neighbor = self.cells[nr][nc]
             if neighbor.type == CellType.CLUE_BOX:
                 licenses = len(self.clue_box_licenses.get((nr, nc), set()))
+                if licenses >= MAX_CLUES_PER_BOX:
+                    continue  # skip full clue boxes
                 candidates.append((licenses, nr, nc))
 
         if candidates:

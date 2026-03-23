@@ -1,0 +1,1441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crossword Generator — Prototype</title>
+<style>
+/* ── Variables ────────────────────────────────────────────────── */
+:root {
+  --cell-size: 38px;
+  --border-color: #333;
+  --black-cell: #222;
+  --theme-bg: #fff8dc;
+  --selected-bg: #cde4f7;
+  --active-entry-bg: #e8f0fe;
+  --correct-bg: #c8f7c5;
+  --wrong-bg: #f7c5c5;
+  --revealed-color: #888;
+  --font-mono: 'Courier New', monospace;
+  --font-sans: system-ui, -apple-system, sans-serif;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --panel-bg: #fafafa;
+  --radius: 6px;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,.08);
+  --shadow-md: 0 4px 12px rgba(0,0,0,.10);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,.14);
+  --easy-color: #16a34a;
+  --medium-color: #d97706;
+  --hard-color: #dc2626;
+}
+
+/* ── Reset & Base ─────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: var(--font-sans); font-size: 14px; color: #1a1a1a; background: #f0f2f5; }
+
+/* ── Layout ───────────────────────────────────────────────────── */
+.app { max-width: 1200px; margin: 0 auto; padding: 16px; }
+.app-title { font-size: 20px; font-weight: 700; margin-bottom: 12px; }
+
+/* ── Tabs ─────────────────────────────────────────────────────── */
+.tab-bar { display: flex; gap: 0; border-bottom: 2px solid #ddd; margin-bottom: 16px; }
+.tab-btn {
+  padding: 8px 24px; border: none; background: none; font-size: 14px; font-weight: 600;
+  cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; color: #666;
+}
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* ── Generate Tab ─────────────────────────────────────────────── */
+.gen-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
+.gen-form label { display: flex; flex-direction: column; gap: 4px; font-weight: 600; font-size: 13px; }
+.gen-form input, .gen-form select, .gen-form textarea {
+  padding: 6px 8px; border: 1px solid #ccc; border-radius: var(--radius); font-size: 13px;
+  font-family: var(--font-sans);
+}
+.gen-form textarea { resize: vertical; min-height: 60px; }
+.gen-form .full-width { grid-column: 1 / -1; }
+.gen-form details { grid-column: 1 / -1; margin-top: 4px; }
+.gen-form details summary { cursor: pointer; font-weight: 600; font-size: 13px; margin-bottom: 8px; }
+.gen-form .adv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 20px; }
+.gen-actions { margin-top: 12px; display: flex; gap: 8px; align-items: center; }
+.cmd-output {
+  margin-top: 12px; background: #1e1e1e; color: #d4d4d4; padding: 12px; border-radius: var(--radius);
+  font-family: var(--font-mono); font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  position: relative; min-height: 40px;
+}
+.cmd-output .copy-btn {
+  position: absolute; top: 6px; right: 6px; background: #444; color: #eee; border: none;
+  border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer;
+}
+.cmd-output .copy-btn:hover { background: #666; }
+
+/* ── Buttons ──────────────────────────────────────────────────── */
+.btn {
+  padding: 7px 16px; border: none; border-radius: var(--radius); font-size: 13px;
+  font-weight: 600; cursor: pointer; background: var(--accent); color: #fff;
+}
+.btn:hover { background: var(--accent-hover); }
+.btn-secondary { background: #e5e7eb; color: #333; }
+.btn-secondary:hover { background: #d1d5db; }
+.btn-danger { background: #ef4444; }
+.btn-danger:hover { background: #dc2626; }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+.btn-ghost {
+  background: none; color: #555; padding: 5px 12px; font-size: 13px; font-weight: 600;
+}
+.btn-ghost:hover { background: #e5e7eb; color: #1a1a1a; }
+
+/* ── Gallery ──────────────────────────────────────────────────── */
+.gallery-toolbar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 16px;
+}
+.gallery-toolbar .load-label {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px;
+  border-radius: var(--radius); font-size: 13px; font-weight: 600; cursor: pointer;
+  background: var(--accent); color: #fff; transition: background .15s;
+}
+.gallery-toolbar .load-label:hover { background: var(--accent-hover); }
+.gallery-toolbar .load-label input { display: none; }
+.gallery-count { font-size: 12px; color: #888; margin-left: auto; }
+
+.drop-zone {
+  border: 2px dashed #ccc; border-radius: 12px; padding: 48px 24px; text-align: center;
+  color: #999; font-size: 14px; transition: all .2s; cursor: pointer; margin-bottom: 16px;
+}
+.drop-zone.drag-over { border-color: var(--accent); background: #eef4ff; color: var(--accent); }
+.drop-zone p { margin-bottom: 8px; }
+.drop-zone .drop-hint { font-size: 12px; color: #bbb; }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+/* ── Card ─────────────────────────────────────────────────────── */
+.card {
+  background: #fff; border-radius: 10px; overflow: hidden; cursor: pointer;
+  box-shadow: var(--shadow-sm); border: 1px solid #e8e8e8;
+  transition: transform .18s ease, box-shadow .18s ease;
+  display: flex; flex-direction: column;
+}
+.card:hover { transform: translateY(-3px); box-shadow: var(--shadow-lg); }
+
+.card-top {
+  position: relative; padding: 14px 16px 10px; display: flex; gap: 14px; align-items: flex-start;
+}
+.card-thumb {
+  flex-shrink: 0; border-radius: 4px; overflow: hidden; border: 1px solid #ddd;
+  background: #fff;
+}
+.card-thumb canvas { display: block; }
+
+.card-info { flex: 1; min-width: 0; }
+.card-title {
+  font-size: 14px; font-weight: 700; line-height: 1.3; margin-bottom: 3px;
+  overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+}
+.card-theme { font-size: 11px; color: #777; margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.card-meta {
+  display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+}
+.card-chip {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 600;
+  background: #f3f4f6; color: #555; white-space: nowrap;
+}
+
+.card-bottom {
+  padding: 0 16px 12px; display: flex; gap: 6px; align-items: center; margin-top: auto;
+}
+.card-date { font-size: 11px; color: #aaa; }
+.card-id { font-size: 10px; color: #ccc; font-family: var(--font-mono); margin-left: auto; }
+
+/* Difficulty badge */
+.diff-badge {
+  padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700;
+  letter-spacing: .3px; text-transform: uppercase; color: #fff;
+}
+.diff-badge.easy { background: var(--easy-color); }
+.diff-badge.medium { background: var(--medium-color); }
+.diff-badge.hard { background: var(--hard-color); }
+
+/* Status stripe */
+.card.status-failed { border-left: 3px solid #ef4444; }
+.card.status-failed .card-title { color: #999; }
+
+/* ── Solve Tab ────────────────────────────────────────────────── */
+.back-row { margin-bottom: 12px; }
+.solve-header { margin-bottom: 12px; }
+.solve-header h2 { font-size: 18px; margin-bottom: 4px; }
+.solve-header p { color: #555; font-size: 13px; line-height: 1.4; }
+.stats-bar {
+  display: flex; gap: 16px; flex-wrap: wrap; padding: 8px 12px; background: var(--panel-bg);
+  border-radius: var(--radius); border: 1px solid #e5e5e5; margin-bottom: 12px; font-size: 12px;
+}
+.stats-bar span { white-space: nowrap; }
+.stats-bar strong { font-weight: 700; }
+
+.solve-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.hint-area { font-size: 13px; color: #555; margin-bottom: 12px; min-height: 20px; }
+
+.solve-layout { display: flex; gap: 20px; align-items: flex-start; flex-wrap: wrap; }
+
+/* ── Grid ─────────────────────────────────────────────────────── */
+.grid-container { flex-shrink: 0; }
+.grid {
+  display: inline-grid;
+  gap: 0;
+  border: 2px solid var(--border-color);
+}
+.grid .cell {
+  width: var(--cell-size); height: var(--cell-size);
+  border: 1px solid #999; position: relative; background: #fff;
+}
+.grid .cell.black { background: var(--black-cell); }
+.grid .cell.theme { background: var(--theme-bg); }
+.grid .cell.selected { background: var(--selected-bg) !important; }
+.grid .cell.active-entry { background: var(--active-entry-bg) !important; }
+.grid .cell.selected.active-entry { background: var(--selected-bg) !important; }
+.grid .cell.correct { background: var(--correct-bg) !important; }
+.grid .cell.wrong { background: var(--wrong-bg) !important; }
+.grid .cell .cell-number {
+  position: absolute; top: 1px; left: 2px; font-size: 9px; font-weight: 700;
+  color: #444; pointer-events: none; line-height: 1;
+}
+.grid .cell input {
+  width: 100%; height: 100%; border: none; background: transparent;
+  text-align: center; font-size: 16px; font-weight: 700; font-family: var(--font-sans);
+  text-transform: uppercase; outline: none; padding: 0; caret-color: transparent;
+}
+.grid .cell input.revealed { color: var(--revealed-color); }
+
+/* ── Clue Panels ──────────────────────────────────────────────── */
+.clue-panels { flex: 1; min-width: 260px; display: flex; gap: 16px; flex-wrap: wrap; }
+.clue-panel { flex: 1; min-width: 220px; }
+.clue-panel h3 {
+  font-size: 14px; font-weight: 700; margin-bottom: 6px;
+  padding-bottom: 4px; border-bottom: 2px solid var(--accent);
+}
+.clue-list { list-style: none; max-height: 500px; overflow-y: auto; }
+.clue-list li {
+  padding: 4px 6px; cursor: pointer; border-radius: 3px; font-size: 13px; line-height: 1.35;
+}
+.clue-list li:hover { background: #e8e8e8; }
+.clue-list li.active-clue { background: var(--active-entry-bg); font-weight: 600; }
+.clue-list .clue-num { font-weight: 700; margin-right: 4px; }
+
+/* ── View Toggle ──────────────────────────────────────────────── */
+.view-toggle { display: flex; gap: 4px; margin-bottom: 12px; }
+.view-toggle .btn { padding: 5px 14px; font-size: 12px; }
+.view-toggle .btn.active-view { background: var(--accent); color: #fff; }
+.view-toggle .btn:not(.active-view) { background: #e5e7eb; color: #555; }
+
+/* ── Print Layout ─────────────────────────────────────────────── */
+:root {
+  --print-cell: 72px;
+  --print-border: #333;
+}
+.print-grid-wrap { overflow-x: auto; padding-bottom: 12px; }
+.print-grid {
+  display: inline-grid;
+  gap: 0;
+  border: 2px solid var(--print-border);
+}
+.print-grid .p-cell {
+  width: var(--print-cell); height: var(--print-cell);
+  border: 1px solid #aaa; position: relative; overflow: hidden;
+}
+.print-grid .p-cell.p-black { background: var(--black-cell); }
+.print-grid .p-cell.p-letter { background: #fff; }
+.print-grid .p-cell.p-letter.p-theme { background: var(--theme-bg); }
+.print-grid .p-cell.p-letter .p-letter-char {
+  position: absolute; bottom: 2px; right: 4px; font-size: 20px; font-weight: 700;
+  color: #bbb; pointer-events: none;
+}
+.print-grid .p-cell.p-cluebox {
+  background: #f0f0f0; padding: 2px 3px; cursor: default;
+  display: flex; flex-direction: column; justify-content: flex-start;
+}
+.print-grid .p-cell.p-cluebox .p-clue-entry {
+  font-size: 7.5px; line-height: 1.2; color: #222; word-break: break-word;
+  overflow: hidden;
+}
+.print-grid .p-cell.p-cluebox .p-clue-entry + .p-clue-entry {
+  margin-top: 1px; padding-top: 1px; border-top: 1px dotted #ccc;
+}
+.print-grid .p-cell.p-cluebox .p-arrow {
+  font-weight: 700; color: var(--accent); font-size: 9px; margin-right: 1px;
+  flex-shrink: 0;
+}
+
+/* ── Cell Tooltip ─────────────────────────────────────────────── */
+#cell-tooltip {
+  position: fixed;
+  z-index: 9999;
+  background: #fff;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 10px 13px;
+  font-size: 12px;
+  line-height: 1.4;
+  box-shadow: 0 6px 20px rgba(0,0,0,.15);
+  max-width: 290px;
+  pointer-events: none;
+  display: none;
+}
+#cell-tooltip .tt-header {
+  font-size: 11px; color: #888; margin-bottom: 6px; font-weight: 600; letter-spacing: .3px;
+}
+#cell-tooltip .tt-entry {
+  margin-top: 7px; padding-top: 7px; border-top: 1px solid #f0f0f0;
+}
+#cell-tooltip .tt-entry:first-of-type { margin-top: 0; padding-top: 0; border-top: none; }
+#cell-tooltip .tt-entry-head { display: flex; align-items: baseline; gap: 5px; margin-bottom: 2px; }
+#cell-tooltip .tt-dir {
+  font-size: 10px; background: #e5e7eb; color: #374151;
+  padding: 1px 5px; border-radius: 3px; flex-shrink: 0; font-weight: 700;
+}
+#cell-tooltip .tt-word {
+  font-family: var(--font-mono); font-weight: 700; font-size: 13px;
+  color: #2563eb; letter-spacing: .5px;
+}
+#cell-tooltip .tt-theme-badge {
+  display: inline-block; background: #fde68a; color: #92400e;
+  padding: 1px 5px; border-radius: 3px; font-size: 9px; font-weight: 700;
+  text-transform: uppercase; flex-shrink: 0;
+}
+#cell-tooltip .tt-clue { color: #222; margin-left: 1px; }
+#cell-tooltip .tt-hint { color: #888; font-style: italic; margin-top: 2px; font-size: 11px; }
+
+/* ── Responsive ───────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  .gen-form { grid-template-columns: 1fr; }
+  .gen-form .adv-grid { grid-template-columns: 1fr; }
+  .solve-layout { flex-direction: column; }
+  .clue-panels { flex-direction: column; }
+  .card-grid { grid-template-columns: 1fr; }
+  :root { --cell-size: 32px; --print-cell: 60px; }
+}
+</style>
+</head>
+<body>
+<div id="cell-tooltip"></div>
+<div class="app">
+  <div class="app-title">Crossword Generator</div>
+
+  <!-- Tab Bar -->
+  <div class="tab-bar">
+    <button class="tab-btn active" data-tab="generate">Generate</button>
+    <button class="tab-btn" data-tab="solve">Crosswords</button>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- GENERATE TAB                                               -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div id="tab-generate" class="tab-panel active">
+    <div class="gen-form">
+      <label>Height <input type="number" id="gen-height" value="15" min="3" max="30"></label>
+      <label>Width <input type="number" id="gen-width" value="12" min="3" max="30"></label>
+
+      <label>Theme Title <input type="text" id="gen-theme-title" placeholder="e.g. Culori De Flori"></label>
+      <label>Theme Type
+        <select id="gen-theme-type">
+          <option value="domain_specific_words" selected>domain_specific_words</option>
+          <option value="words_containing_substring">words_containing_substring</option>
+          <option value="joke_continuation">joke_continuation</option>
+          <option value="custom">custom</option>
+        </select>
+      </label>
+
+      <label class="full-width">Theme Description
+        <textarea id="gen-theme-desc" placeholder="Additional context for the LLM prompt"></textarea>
+      </label>
+
+      <label class="full-width">Words (one per line, WORD or WORD:Clue)
+        <textarea id="gen-words" placeholder="TRANDAFIR&#10;LALEA:Floare de primavara"></textarea>
+      </label>
+
+      <label>Difficulty
+        <select id="gen-difficulty">
+          <option value="EASY">EASY</option>
+          <option value="MEDIUM" selected>MEDIUM</option>
+          <option value="HARD">HARD</option>
+        </select>
+      </label>
+
+      <label>Seed (optional) <input type="number" id="gen-seed" placeholder="random"></label>
+
+      <!-- Advanced -->
+      <details>
+        <summary>Advanced Parameters</summary>
+        <div class="adv-grid">
+          <label>Completion Target <input type="number" id="gen-completion" value="0.85" step="0.05" min="0" max="1"></label>
+          <label>Min Theme Coverage <input type="number" id="gen-coverage" value="0.10" step="0.05" min="0" max="1"></label>
+          <label>Language <input type="text" id="gen-language" value="Romanian"></label>
+          <label style="flex-direction:row; align-items:center; gap:8px;">
+            <input type="checkbox" id="gen-blocker-zone" checked> Place Blocker Zone
+          </label>
+          <label>Blocker Zone Height <input type="number" id="gen-bz-height" placeholder="auto"></label>
+          <label>Blocker Zone Width <input type="number" id="gen-bz-width" placeholder="auto"></label>
+          <label>Blocker Zone Row <input type="number" id="gen-bz-row" placeholder="auto"></label>
+          <label>Blocker Zone Col <input type="number" id="gen-bz-col" placeholder="auto"></label>
+          <label style="flex-direction:row; align-items:center; gap:8px;">
+            <input type="checkbox" id="gen-llm"> LLM (extend with Gemini)
+          </label>
+          <label style="flex-direction:row; align-items:center; gap:8px;">
+            <input type="checkbox" id="gen-clues"> Generate Clues
+          </label>
+        </div>
+      </details>
+    </div>
+
+    <div class="gen-actions">
+      <button class="btn" onclick="buildCommand()">Generate Command</button>
+    </div>
+
+    <div class="cmd-output" id="cmd-output" style="display:none;">
+      <button class="copy-btn" onclick="copyCommand()">Copy</button>
+      <code id="cmd-text"></code>
+    </div>
+  </div>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- CROSSWORDS TAB                                             -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <div id="tab-solve" class="tab-panel">
+
+    <!-- ── Gallery view ─────────────────────────────────────── -->
+    <div id="gallery-view">
+      <div class="drop-zone" id="drop-zone">
+        <p>Drop crossword JSON files or a folder here</p>
+        <span class="drop-hint">or use the button below</span>
+      </div>
+      <div class="gallery-toolbar">
+        <label class="load-label">
+          Load files
+          <input type="file" id="file-input" accept=".json" multiple>
+        </label>
+        <label class="load-label" style="background:#6b7280;">
+          Load folder
+          <input type="file" id="folder-input" webkitdirectory>
+        </label>
+        <span class="gallery-count" id="gallery-count"></span>
+      </div>
+      <div class="card-grid" id="card-grid"></div>
+    </div>
+
+    <!-- ── Puzzle view (hidden until a card is clicked) ──── -->
+    <div id="puzzle-area" style="display:none;">
+      <div class="back-row">
+        <button class="btn btn-ghost" onclick="backToGallery()">&larr; Back to gallery</button>
+      </div>
+
+      <div class="solve-header">
+        <h2 id="puzzle-title"></h2>
+        <p id="puzzle-desc"></p>
+      </div>
+
+      <div class="stats-bar" id="stats-bar"></div>
+
+      <!-- View toggle -->
+      <div class="view-toggle">
+        <button class="btn active-view" data-view="solve" onclick="switchView('solve')">Solve</button>
+        <button class="btn" data-view="print" onclick="switchView('print')">Print Layout</button>
+      </div>
+
+      <!-- Solve view -->
+      <div id="view-solve">
+        <div class="solve-actions">
+          <button class="btn btn-secondary btn-sm" onclick="checkPuzzle()">Check</button>
+          <button class="btn btn-secondary btn-sm" onclick="revealPuzzle()">Reveal</button>
+          <button class="btn btn-danger btn-sm" onclick="clearPuzzle()">Clear</button>
+          <button class="btn btn-secondary btn-sm" id="hint-btn" onclick="showHint()" disabled>Hint</button>
+        </div>
+
+        <div class="hint-area" id="hint-area"></div>
+
+        <div class="solve-layout">
+          <div class="grid-container">
+            <div class="grid" id="grid"></div>
+          </div>
+          <div class="clue-panels">
+            <div class="clue-panel">
+              <h3>Across</h3>
+              <ul class="clue-list" id="clues-across"></ul>
+            </div>
+            <div class="clue-panel">
+              <h3>Down</h3>
+              <ul class="clue-list" id="clues-down"></ul>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Print layout view -->
+      <div id="view-print" style="display:none;">
+        <div class="solve-actions">
+          <label style="font-size:12px; display:flex; align-items:center; gap:6px;">
+            <input type="checkbox" id="print-show-answers"> Show answers
+          </label>
+        </div>
+        <div class="print-grid-wrap">
+          <div class="print-grid" id="print-grid"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ════════════════════════════════════════════════════════════════
+   TAB SWITCHING
+   ════════════════════════════════════════════════════════════════ */
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+/* ════════════════════════════════════════════════════════════════
+   GENERATE TAB — Command Builder
+   ════════════════════════════════════════════════════════════════ */
+function buildCommand() {
+  const parts = ['.venv/bin/python -m main'];
+
+  const h = document.getElementById('gen-height').value;
+  const w = document.getElementById('gen-width').value;
+  parts.push('--height ' + h, '--width ' + w);
+
+  const title = document.getElementById('gen-theme-title').value.trim();
+  if (title) parts.push('--theme-title "' + title + '"');
+
+  const ttype = document.getElementById('gen-theme-type').value;
+  if (ttype !== 'domain_specific_words') parts.push('--theme-type ' + ttype);
+
+  const desc = document.getElementById('gen-theme-desc').value.trim();
+  if (desc) parts.push('--theme-description "' + desc.replace(/"/g, '\\"') + '"');
+
+  const wordsRaw = document.getElementById('gen-words').value.trim();
+  if (wordsRaw) {
+    const words = wordsRaw.split('\n').map(w => w.trim()).filter(Boolean);
+    if (words.length > 0) parts.push('--words ' + words.map(w => '"' + w + '"').join(' '));
+  }
+
+  const diff = document.getElementById('gen-difficulty').value;
+  if (diff !== 'MEDIUM') parts.push('--difficulty ' + diff);
+
+  const seed = document.getElementById('gen-seed').value.trim();
+  if (seed) parts.push('--seed ' + seed);
+
+  const comp = document.getElementById('gen-completion').value;
+  if (comp && parseFloat(comp) !== 0.85) parts.push('--completion-target ' + comp);
+
+  const cov = document.getElementById('gen-coverage').value;
+  if (cov && parseFloat(cov) !== 0.10) parts.push('--min-theme-coverage ' + cov);
+
+  const lang = document.getElementById('gen-language').value.trim();
+  if (lang && lang !== 'Romanian') parts.push('--language "' + lang + '"');
+
+  if (!document.getElementById('gen-blocker-zone').checked) {
+    parts.push('--no-blocker-zone');
+  } else {
+    const bzh = document.getElementById('gen-bz-height').value.trim();
+    const bzw = document.getElementById('gen-bz-width').value.trim();
+    const bzr = document.getElementById('gen-bz-row').value.trim();
+    const bzc = document.getElementById('gen-bz-col').value.trim();
+    if (bzh) parts.push('--blocker-zone-height ' + bzh);
+    if (bzw) parts.push('--blocker-zone-width ' + bzw);
+    if (bzr) parts.push('--blocker-zone-row ' + bzr);
+    if (bzc) parts.push('--blocker-zone-col ' + bzc);
+  }
+
+  if (document.getElementById('gen-llm').checked) parts.push('--llm');
+  if (document.getElementById('gen-clues').checked) parts.push('--clues');
+
+  const cmd = parts.join(' \\\n  ');
+  document.getElementById('cmd-text').textContent = cmd;
+  document.getElementById('cmd-output').style.display = 'block';
+}
+
+function copyCommand() {
+  const text = document.getElementById('cmd-text').textContent;
+  navigator.clipboard.writeText(text.replace(/ \\\n  /g, ' ')).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1500);
+  });
+}
+
+/* ════════════════════════════════════════════════════════════════
+   GALLERY — State & Loading
+   ════════════════════════════════════════════════════════════════ */
+let galleryItems = []; // array of parsed JSON docs
+
+document.getElementById('file-input').addEventListener('change', (e) => {
+  loadFiles(e.target.files);
+});
+document.getElementById('folder-input').addEventListener('change', (e) => {
+  loadFiles(e.target.files);
+});
+
+// Drag & drop
+const dropZone = document.getElementById('drop-zone');
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const items = e.dataTransfer.items;
+  if (items) {
+    const filePromises = [];
+    for (const item of items) {
+      const entry = item.webkitGetAsEntry?.();
+      if (entry) {
+        filePromises.push(readEntry(entry));
+      } else if (item.kind === 'file') {
+        filePromises.push(Promise.resolve([item.getAsFile()]));
+      }
+    }
+    Promise.all(filePromises).then(arrs => {
+      const files = arrs.flat().filter(f => f && f.name.endsWith('.json'));
+      loadFileObjects(files);
+    });
+  }
+});
+
+function readEntry(entry) {
+  return new Promise((resolve) => {
+    if (entry.isFile) {
+      entry.file(f => resolve([f]));
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      reader.readEntries(entries => {
+        Promise.all(entries.map(e => readEntry(e))).then(arrs => resolve(arrs.flat()));
+      });
+    } else {
+      resolve([]);
+    }
+  });
+}
+
+function loadFiles(fileList) {
+  const jsonFiles = Array.from(fileList).filter(f => f.name.endsWith('.json'));
+  loadFileObjects(jsonFiles);
+}
+
+function loadFileObjects(files) {
+  let loaded = 0;
+  files.forEach(file => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const doc = JSON.parse(ev.target.result);
+        if (doc.grid && doc.entries) {
+          // Avoid duplicates
+          if (!galleryItems.find(d => d.id === doc.id)) {
+            galleryItems.push(doc);
+          }
+        }
+      } catch (_) { /* skip non-crossword files */ }
+      loaded++;
+      if (loaded === files.length) renderGallery();
+    };
+    reader.readAsText(file);
+  });
+  if (files.length === 0) renderGallery();
+}
+
+/* ════════════════════════════════════════════════════════════════
+   GALLERY — Card Rendering
+   ════════════════════════════════════════════════════════════════ */
+function renderGallery() {
+  // Sort newest first
+  galleryItems.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+  const grid = document.getElementById('card-grid');
+  grid.innerHTML = '';
+
+  const countEl = document.getElementById('gallery-count');
+  countEl.textContent = galleryItems.length
+    ? `${galleryItems.length} crossword${galleryItems.length > 1 ? 's' : ''}`
+    : '';
+
+  // Collapse drop zone if we have items
+  const dz = document.getElementById('drop-zone');
+  dz.style.display = galleryItems.length ? 'none' : '';
+
+  galleryItems.forEach((doc, idx) => {
+    const card = document.createElement('div');
+    card.className = 'card' + (doc.status === 'failed' ? ' status-failed' : '');
+    card.addEventListener('click', () => openPuzzle(doc));
+
+    const diffLower = (doc.difficulty || 'medium').toLowerCase();
+    const diffColor = diffLower === 'easy' ? 'easy' : diffLower === 'hard' ? 'hard' : 'medium';
+    const wordCount = doc.stats?.word_count || doc.entries?.length || 0;
+    const themeCount = doc.entries?.filter(e => e.theme).length || 0;
+
+    // Format date
+    let dateStr = '';
+    if (doc.created_at) {
+      const d = new Date(doc.created_at);
+      dateStr = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+    }
+
+    card.innerHTML = `
+      <div class="card-top">
+        <div class="card-thumb" id="thumb-${idx}"></div>
+        <div class="card-info">
+          <div class="card-title">${escapeHtml(doc.title || 'Untitled')}</div>
+          <div class="card-theme">${escapeHtml(doc.theme_title || '')}</div>
+          <div class="card-meta">
+            <span class="diff-badge ${diffColor}">${(doc.difficulty || 'MEDIUM').toUpperCase()}</span>
+            <span class="card-chip">${doc.width}&times;${doc.height}</span>
+            <span class="card-chip">${wordCount} words</span>
+            ${themeCount ? `<span class="card-chip">${themeCount} theme</span>` : ''}
+          </div>
+        </div>
+      </div>
+      <div class="card-bottom">
+        <span class="card-date">${dateStr}</span>
+        <span class="card-id">${doc.id || ''}</span>
+      </div>
+    `;
+
+    grid.appendChild(card);
+
+    // Draw mini thumbnail
+    requestAnimationFrame(() => {
+      const container = document.getElementById('thumb-' + idx);
+      if (container) drawThumb(container, doc);
+    });
+  });
+}
+
+function drawThumb(container, doc) {
+  const W = doc.width, H = doc.height;
+  const px = 4; // pixels per cell
+  const canvas = document.createElement('canvas');
+  canvas.width = W * px;
+  canvas.height = H * px;
+  canvas.style.width = (W * px) + 'px';
+  canvas.style.height = (H * px) + 'px';
+  const ctx = canvas.getContext('2d');
+
+  // Build theme cell set
+  const themeCells = new Set();
+  (doc.entries || []).filter(e => e.theme).forEach(e => {
+    for (let i = 0; i < e.len; i++) {
+      const r = e.dir === 'A' ? e.r : e.r + i;
+      const c = e.dir === 'A' ? e.c + i : e.c;
+      themeCells.add(r + ',' + c);
+    }
+  });
+
+  const g = doc.grid || '';
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const ch = g[r * W + c];
+      if (ch === '_') {
+        ctx.fillStyle = '#333';
+      } else if (themeCells.has(r + ',' + c)) {
+        ctx.fillStyle = '#f5d060';
+      } else {
+        ctx.fillStyle = '#e8e8e8';
+      }
+      ctx.fillRect(c * px, r * px, px, px);
+    }
+  }
+  container.appendChild(canvas);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   GALLERY ↔ PUZZLE Navigation
+   ════════════════════════════════════════════════════════════════ */
+function openPuzzle(doc) {
+  document.getElementById('gallery-view').style.display = 'none';
+  document.getElementById('puzzle-area').style.display = '';
+  loadPuzzle(doc);
+  // Reset to solve view
+  switchView('solve');
+}
+
+function backToGallery() {
+  document.getElementById('puzzle-area').style.display = 'none';
+  document.getElementById('gallery-view').style.display = '';
+}
+
+/* ════════════════════════════════════════════════════════════════
+   SOLVE TAB — State
+   ════════════════════════════════════════════════════════════════ */
+let puzzle = null;
+let cells = [];
+let entries = [];
+let entryMap = {};
+let cellEntries = {};
+let selectedCell = null;
+let direction = 'A';
+let activeEntry = null;
+let hintCount = {};
+let printClueBoxMap = {};
+
+/* ════════════════════════════════════════════════════════════════
+   Puzzle Initialization
+   ════════════════════════════════════════════════════════════════ */
+function loadPuzzle(data) {
+  puzzle = data;
+  hintCount = {};
+
+  const sorted = [...data.entries].sort((a, b) => {
+    if (a.r !== b.r) return a.r - b.r;
+    return a.c - b.c;
+  });
+
+  const posNumbers = {};
+  let num = 1;
+  sorted.forEach(e => {
+    const key = e.r + ',' + e.c;
+    if (!(key in posNumbers)) posNumbers[key] = num++;
+  });
+
+  entries = data.entries.map(e => ({
+    ...e,
+    number: posNumbers[e.r + ',' + e.c]
+  }));
+
+  entryMap = {};
+  entries.forEach(e => entryMap[e.id] = e);
+
+  cellEntries = {};
+  entries.forEach(e => {
+    for (let i = 0; i < e.len; i++) {
+      const r = e.dir === 'A' ? e.r : e.r + i;
+      const c = e.dir === 'A' ? e.c + i : e.c;
+      const key = r + ',' + c;
+      if (!cellEntries[key]) cellEntries[key] = [];
+      cellEntries[key].push(e);
+    }
+  });
+
+  renderGrid();
+  renderClues();
+  renderStats();
+
+  document.getElementById('puzzle-title').textContent = data.title || 'Crossword';
+  document.getElementById('puzzle-desc').textContent = data.theme_content || '';
+  document.getElementById('puzzle-area').style.display = '';
+  document.getElementById('hint-area').textContent = '';
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Grid Rendering
+   ════════════════════════════════════════════════════════════════ */
+function renderGrid() {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  grid.style.gridTemplateColumns = `repeat(${puzzle.width}, var(--cell-size))`;
+
+  const gridStr = puzzle.grid;
+  cells = [];
+
+  const themeCells = new Set();
+  entries.filter(e => e.theme).forEach(e => {
+    for (let i = 0; i < e.len; i++) {
+      const r = e.dir === 'A' ? e.r : e.r + i;
+      const c = e.dir === 'A' ? e.c + i : e.c;
+      themeCells.add(r + ',' + c);
+    }
+  });
+
+  const numberMap = {};
+  entries.forEach(e => {
+    const key = e.r + ',' + e.c;
+    if (!numberMap[key]) numberMap[key] = e.number;
+  });
+
+  for (let r = 0; r < puzzle.height; r++) {
+    cells[r] = [];
+    for (let c = 0; c < puzzle.width; c++) {
+      const idx = r * puzzle.width + c;
+      const ch = gridStr[idx];
+      const div = document.createElement('div');
+      div.classList.add('cell');
+
+      if (ch === '_') {
+        div.classList.add('black');
+        cells[r][c] = null;
+      } else {
+        if (themeCells.has(r + ',' + c)) div.classList.add('theme');
+
+        const numKey = r + ',' + c;
+        if (numberMap[numKey]) {
+          const span = document.createElement('span');
+          span.className = 'cell-number';
+          span.textContent = numberMap[numKey];
+          div.appendChild(span);
+        }
+
+        const input = document.createElement('input');
+        input.maxLength = 1;
+        input.dataset.r = r;
+        input.dataset.c = c;
+        input.dataset.answer = ch;
+        input.addEventListener('click', onCellClick);
+        input.addEventListener('keydown', onCellKeydown);
+        input.addEventListener('input', onCellInput);
+        input.addEventListener('focus', () => selectCell(r, c));
+        div.appendChild(input);
+        cells[r][c] = div;
+      }
+
+      grid.appendChild(div);
+    }
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Clue Rendering
+   ════════════════════════════════════════════════════════════════ */
+function renderClues() {
+  const acrossEl = document.getElementById('clues-across');
+  const downEl = document.getElementById('clues-down');
+  acrossEl.innerHTML = '';
+  downEl.innerHTML = '';
+
+  const across = entries.filter(e => e.dir === 'A').sort((a, b) => a.number - b.number);
+  const down = entries.filter(e => e.dir === 'D').sort((a, b) => a.number - b.number);
+
+  across.forEach(e => acrossEl.appendChild(makeClueItem(e)));
+  down.forEach(e => downEl.appendChild(makeClueItem(e)));
+}
+
+function makeClueItem(entry) {
+  const li = document.createElement('li');
+  li.dataset.entryId = entry.id;
+  li.innerHTML = `<span class="clue-num">${entry.number}.</span>${entry.clue || '\u2014'}`;
+  li.addEventListener('click', () => {
+    direction = entry.dir;
+    selectCell(entry.r, entry.c);
+    focusFirstEmpty(entry);
+  });
+  return li;
+}
+
+function focusFirstEmpty(entry) {
+  for (let i = 0; i < entry.len; i++) {
+    const r = entry.dir === 'A' ? entry.r : entry.r + i;
+    const c = entry.dir === 'A' ? entry.c + i : entry.c;
+    const cell = cells[r]?.[c];
+    if (cell) {
+      const inp = cell.querySelector('input');
+      if (inp && !inp.value) { inp.focus(); selectCell(r, c); return; }
+    }
+  }
+  const cell = cells[entry.r]?.[entry.c];
+  if (cell) { cell.querySelector('input')?.focus(); selectCell(entry.r, entry.c); }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Stats
+   ════════════════════════════════════════════════════════════════ */
+function renderStats() {
+  const s = puzzle.stats;
+  if (!s) { document.getElementById('stats-bar').style.display = 'none'; return; }
+  document.getElementById('stats-bar').style.display = '';
+  document.getElementById('stats-bar').innerHTML = [
+    `<span><strong>Words:</strong> ${s.word_count}</span>`,
+    `<span><strong>Theme:</strong> ${(s.theme_coverage * 100).toFixed(1)}%</span>`,
+    `<span><strong>Difficulty:</strong> ${s.difficulty_avg?.toFixed(3) ?? '\u2014'}</span>`,
+    `<span><strong>Easy:</strong> ${(s.easy_pct * 100).toFixed(0)}%</span>`,
+    `<span><strong>Medium:</strong> ${(s.medium_pct * 100).toFixed(0)}%</span>`,
+    `<span><strong>Hard:</strong> ${(s.hard_pct * 100).toFixed(0)}%</span>`,
+  ].join('');
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Cell Selection & Highlighting
+   ════════════════════════════════════════════════════════════════ */
+function selectCell(r, c) {
+  document.querySelectorAll('.grid .cell.selected, .grid .cell.active-entry').forEach(el => {
+    el.classList.remove('selected', 'active-entry');
+  });
+  document.querySelectorAll('.clue-list li.active-clue').forEach(el => el.classList.remove('active-clue'));
+
+  selectedCell = { r, c };
+
+  const key = r + ',' + c;
+  const available = cellEntries[key] || [];
+  activeEntry = available.find(e => e.dir === direction) || available[0] || null;
+  if (activeEntry) direction = activeEntry.dir;
+
+  if (activeEntry) {
+    for (let i = 0; i < activeEntry.len; i++) {
+      const er = activeEntry.dir === 'A' ? activeEntry.r : activeEntry.r + i;
+      const ec = activeEntry.dir === 'A' ? activeEntry.c + i : activeEntry.c;
+      const cell = cells[er]?.[ec];
+      if (cell) cell.classList.add('active-entry');
+    }
+    const clueLi = document.querySelector(`.clue-list li[data-entry-id="${activeEntry.id}"]`);
+    if (clueLi) {
+      clueLi.classList.add('active-clue');
+      clueLi.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  const selCell = cells[r]?.[c];
+  if (selCell) selCell.classList.add('selected');
+
+  updateHintButton();
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Cell Click — Toggle Direction
+   ════════════════════════════════════════════════════════════════ */
+let lastClickCell = null;
+let lastClickTime = 0;
+
+function onCellClick(e) {
+  const r = +e.target.dataset.r;
+  const c = +e.target.dataset.c;
+  const now = Date.now();
+
+  if (lastClickCell && lastClickCell.r === r && lastClickCell.c === c && now - lastClickTime < 500) {
+    toggleDirection(r, c);
+  }
+  lastClickCell = { r, c };
+  lastClickTime = now;
+}
+
+function toggleDirection(r, c) {
+  const key = r + ',' + c;
+  const available = cellEntries[key] || [];
+  if (available.length > 1) {
+    direction = direction === 'A' ? 'D' : 'A';
+    selectCell(r, c);
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Keyboard Navigation
+   ════════════════════════════════════════════════════════════════ */
+function onCellKeydown(e) {
+  const r = +e.target.dataset.r;
+  const c = +e.target.dataset.c;
+
+  clearCheckHighlights();
+
+  switch (e.key) {
+    case 'ArrowUp':    e.preventDefault(); moveToCell(r - 1, c, -1, 0); break;
+    case 'ArrowDown':  e.preventDefault(); moveToCell(r + 1, c, 1, 0); break;
+    case 'ArrowLeft':  e.preventDefault(); moveToCell(r, c - 1, 0, -1); break;
+    case 'ArrowRight': e.preventDefault(); moveToCell(r, c + 1, 0, 1); break;
+    case 'Tab':
+      e.preventDefault();
+      moveToNextEntry(e.shiftKey);
+      break;
+    case 'Enter':
+      e.preventDefault();
+      toggleDirection(r, c);
+      break;
+    case 'Backspace':
+      e.preventDefault();
+      e.target.value = '';
+      if (direction === 'A') moveToCell(r, c - 1, 0, -1);
+      else moveToCell(r - 1, c, -1, 0);
+      break;
+    case 'Delete':
+      e.preventDefault();
+      e.target.value = '';
+      break;
+  }
+}
+
+function onCellInput(e) {
+  const val = e.target.value;
+  if (val && /^[a-zA-Z\u0103\u00e2\u00ee\u0219\u021b\u0102\u00c2\u00ce\u0218\u021a]$/.test(val)) {
+    e.target.value = val.toUpperCase();
+    const r = +e.target.dataset.r;
+    const c = +e.target.dataset.c;
+    if (direction === 'A') moveToCell(r, c + 1, 0, 1);
+    else moveToCell(r + 1, c, 1, 0);
+  } else if (val.length > 1) {
+    e.target.value = val.slice(-1).toUpperCase();
+    const r = +e.target.dataset.r;
+    const c = +e.target.dataset.c;
+    if (direction === 'A') moveToCell(r, c + 1, 0, 1);
+    else moveToCell(r + 1, c, 1, 0);
+  }
+}
+
+function moveToCell(r, c, dr, dc) {
+  while (r >= 0 && r < puzzle.height && c >= 0 && c < puzzle.width) {
+    if (cells[r]?.[c]) {
+      const inp = cells[r][c].querySelector('input');
+      if (inp) { inp.focus(); selectCell(r, c); }
+      return;
+    }
+    r += dr;
+    c += dc;
+  }
+}
+
+function moveToNextEntry(backwards) {
+  if (!activeEntry) return;
+  const dirEntries = entries.filter(e => e.dir === direction).sort((a, b) => a.number - b.number);
+  const idx = dirEntries.findIndex(e => e.id === activeEntry.id);
+  let nextIdx;
+  if (backwards) {
+    nextIdx = idx <= 0 ? dirEntries.length - 1 : idx - 1;
+  } else {
+    nextIdx = idx >= dirEntries.length - 1 ? 0 : idx + 1;
+  }
+  if (nextIdx === idx && dirEntries.length === 1) {
+    direction = direction === 'A' ? 'D' : 'A';
+    const otherEntries = entries.filter(e => e.dir === direction).sort((a, b) => a.number - b.number);
+    if (otherEntries.length > 0) {
+      const ne = otherEntries[0];
+      selectCell(ne.r, ne.c);
+      focusFirstEmpty(ne);
+      return;
+    }
+  }
+  const ne = dirEntries[nextIdx];
+  selectCell(ne.r, ne.c);
+  focusFirstEmpty(ne);
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Check / Reveal / Clear
+   ════════════════════════════════════════════════════════════════ */
+function clearCheckHighlights() {
+  document.querySelectorAll('.grid .cell.correct, .grid .cell.wrong').forEach(el => {
+    el.classList.remove('correct', 'wrong');
+  });
+}
+
+function checkPuzzle() {
+  clearCheckHighlights();
+  for (let r = 0; r < puzzle.height; r++) {
+    for (let c = 0; c < puzzle.width; c++) {
+      const cell = cells[r]?.[c];
+      if (!cell) continue;
+      const inp = cell.querySelector('input');
+      if (!inp || !inp.value) continue;
+      if (inp.value.toUpperCase() === inp.dataset.answer) {
+        cell.classList.add('correct');
+      } else {
+        cell.classList.add('wrong');
+      }
+    }
+  }
+  setTimeout(clearCheckHighlights, 2000);
+}
+
+function revealPuzzle() {
+  for (let r = 0; r < puzzle.height; r++) {
+    for (let c = 0; c < puzzle.width; c++) {
+      const cell = cells[r]?.[c];
+      if (!cell) continue;
+      const inp = cell.querySelector('input');
+      if (!inp) continue;
+      inp.value = inp.dataset.answer;
+      inp.classList.add('revealed');
+    }
+  }
+}
+
+function clearPuzzle() {
+  clearCheckHighlights();
+  for (let r = 0; r < puzzle.height; r++) {
+    for (let c = 0; c < puzzle.width; c++) {
+      const cell = cells[r]?.[c];
+      if (!cell) continue;
+      const inp = cell.querySelector('input');
+      if (!inp) continue;
+      inp.value = '';
+      inp.classList.remove('revealed');
+    }
+  }
+  hintCount = {};
+  document.getElementById('hint-area').textContent = '';
+}
+
+/* ════════════════════════════════════════════════════════════════
+   Hints
+   ════════════════════════════════════════════════════════════════ */
+function updateHintButton() {
+  const btn = document.getElementById('hint-btn');
+  if (!activeEntry) { btn.disabled = true; return; }
+  const hasHint = activeEntry.hint_1 || activeEntry.hint_2;
+  const used = hintCount[activeEntry.id] || 0;
+  btn.disabled = !hasHint || used >= 2;
+}
+
+function showHint() {
+  if (!activeEntry) return;
+  const id = activeEntry.id;
+  const used = hintCount[id] || 0;
+  const hintArea = document.getElementById('hint-area');
+
+  if (used === 0 && activeEntry.hint_1) {
+    hintArea.textContent = `Hint 1 (${activeEntry.number}${activeEntry.dir}): ${activeEntry.hint_1}`;
+    hintCount[id] = 1;
+  } else if (used <= 1 && activeEntry.hint_2) {
+    hintArea.textContent = `Hint 2 (${activeEntry.number}${activeEntry.dir}): ${activeEntry.hint_2}`;
+    hintCount[id] = 2;
+  }
+  updateHintButton();
+}
+
+/* ════════════════════════════════════════════════════════════════
+   VIEW SWITCHING
+   ════════════════════════════════════════════════════════════════ */
+function switchView(view) {
+  document.querySelectorAll('.view-toggle .btn').forEach(b => {
+    b.classList.toggle('active-view', b.dataset.view === view);
+  });
+  document.getElementById('view-solve').style.display = view === 'solve' ? '' : 'none';
+  document.getElementById('view-print').style.display = view === 'print' ? '' : 'none';
+  if (view === 'print' && puzzle) renderPrintGrid();
+}
+
+document.getElementById('print-show-answers')?.addEventListener('change', () => {
+  if (puzzle) renderPrintGrid();
+});
+
+/* ════════════════════════════════════════════════════════════════
+   PRINT LAYOUT — Clue Box Inference
+   ════════════════════════════════════════════════════════════════ */
+function inferClueBoxes() {
+  const g = puzzle.grid;
+  const W = puzzle.width, H = puzzle.height;
+  const isBlank = (r, c) => r >= 0 && r < H && c >= 0 && c < W && g[r * W + c] === '_';
+
+  const bz = puzzle.blocker_zone || null; // [row, col, height, width]
+  function inBlockerZone(r, c) {
+    if (!bz) return false;
+    return r >= bz[0] && r < bz[0] + bz[2] && c >= bz[1] && c < bz[1] + bz[3];
+  }
+
+  const clueBoxMap = {};
+  const clueBoxSet = new Set();
+
+  const offsets = {
+    A: [[0, -1], [-1, 0], [1, 0]],
+    D: [[-1, 0], [0, -1], [0, 1]]
+  };
+
+  entries.forEach(entry => {
+    if (entry.cb) {
+      const key = entry.cb[0] + ',' + entry.cb[1];
+      if (!clueBoxMap[key]) clueBoxMap[key] = [];
+      clueBoxMap[key].push(entry);
+      clueBoxSet.add(key);
+      return;
+    }
+
+    const { r, c, dir } = entry;
+    const prio = offsets[dir] || offsets.A;
+
+    for (const [dr, dc] of prio) {
+      const nr = r + dr, nc = c + dc;
+      const key = nr + ',' + nc;
+      if (clueBoxSet.has(key)) {
+        clueBoxMap[key].push(entry);
+        return;
+      }
+    }
+
+    for (const [dr, dc] of prio) {
+      const nr = r + dr, nc = c + dc;
+      if (isBlank(nr, nc) && !inBlockerZone(nr, nc)) {
+        const key = nr + ',' + nc;
+        if (!clueBoxMap[key]) clueBoxMap[key] = [];
+        clueBoxMap[key].push(entry);
+        clueBoxSet.add(key);
+        return;
+      }
+    }
+
+    for (let dr = -2; dr <= 1; dr++) {
+      for (let dc = -2; dc <= 1; dc++) {
+        if (dr === 0 && dc === 0) continue;
+        const nr = r + dr, nc = c + dc;
+        if (isBlank(nr, nc) && !inBlockerZone(nr, nc)) {
+          const key = nr + ',' + nc;
+          if (!clueBoxMap[key]) clueBoxMap[key] = [];
+          clueBoxMap[key].push(entry);
+          clueBoxSet.add(key);
+          return;
+        }
+      }
+    }
+  });
+
+  return { clueBoxMap, clueBoxSet };
+}
+
+/* ════════════════════════════════════════════════════════════════
+   PRINT LAYOUT — Grid Rendering
+   ════════════════════════════════════════════════════════════════ */
+function renderPrintGrid() {
+  const grid = document.getElementById('print-grid');
+  grid.innerHTML = '';
+  grid.style.gridTemplateColumns = `repeat(${puzzle.width}, var(--print-cell))`;
+
+  const gridStr = puzzle.grid;
+  const W = puzzle.width, H = puzzle.height;
+  const showAnswers = document.getElementById('print-show-answers')?.checked;
+
+  const themeCells = new Set();
+  entries.filter(e => e.theme).forEach(e => {
+    for (let i = 0; i < e.len; i++) {
+      const r = e.dir === 'A' ? e.r : e.r + i;
+      const c = e.dir === 'A' ? e.c + i : e.c;
+      themeCells.add(r + ',' + c);
+    }
+  });
+
+  const { clueBoxMap, clueBoxSet } = inferClueBoxes();
+  printClueBoxMap = clueBoxMap;
+
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      const idx = r * W + c;
+      const ch = gridStr[idx];
+      const div = document.createElement('div');
+      div.classList.add('p-cell');
+      div.dataset.r = r;
+      div.dataset.c = c;
+      const key = r + ',' + c;
+
+      if (ch === '_') {
+        if (clueBoxSet.has(key)) {
+          div.classList.add('p-cluebox');
+          const clueEntries = clueBoxMap[key] || [];
+          clueEntries.slice(0, 3).forEach(entry => {
+            const clueDiv = document.createElement('div');
+            clueDiv.className = 'p-clue-entry';
+            const arrow = entry.dir === 'A' ? '\u2192' : '\u2193';
+            const clueText = entry.clue || '\u2014';
+            clueDiv.innerHTML = `<span class="p-arrow">${arrow}</span>${escapeHtml(clueText)}`;
+            div.appendChild(clueDiv);
+          });
+        } else {
+          div.classList.add('p-black');
+        }
+      } else {
+        div.classList.add('p-letter');
+        if (themeCells.has(key)) div.classList.add('p-theme');
+        if (showAnswers) {
+          const span = document.createElement('span');
+          span.className = 'p-letter-char';
+          span.textContent = ch;
+          div.appendChild(span);
+        }
+      }
+
+      grid.appendChild(div);
+    }
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+/* ════════════════════════════════════════════════════════════════
+   PRINT LAYOUT — Cell Tooltip
+   ════════════════════════════════════════════════════════════════ */
+function getWordForEntry(entry) {
+  const g = puzzle.grid;
+  const W = puzzle.width;
+  let word = '';
+  for (let i = 0; i < entry.len; i++) {
+    const r = entry.dir === 'A' ? entry.r : entry.r + i;
+    const c = entry.dir === 'A' ? entry.c + i : entry.c;
+    word += g[r * W + c];
+  }
+  return word;
+}
+
+function entryHtml(entry) {
+  const arrow = entry.dir === 'A' ? '→' : '↓';
+  const word = getWordForEntry(entry);
+  const themeBadge = entry.theme ? '<span class="tt-theme-badge">THEME</span>' : '';
+  const hint1 = entry.hint_1 ? `<div class="tt-hint">Hint 1: ${escapeHtml(entry.hint_1)}</div>` : '';
+  const hint2 = entry.hint_2 ? `<div class="tt-hint">Hint 2: ${escapeHtml(entry.hint_2)}</div>` : '';
+  return `<div class="tt-entry">
+    <div class="tt-entry-head">
+      <span class="tt-dir">${arrow} ${entry.number}${entry.dir}</span>
+      <span class="tt-word">${escapeHtml(word)}</span>${themeBadge}
+    </div>
+    <div class="tt-clue">${escapeHtml(entry.clue || '—')}</div>
+    ${hint1}${hint2}
+  </div>`;
+}
+
+function buildPrintTooltipHtml(r, c, cellEl) {
+  const key = r + ',' + c;
+
+  if (cellEl.classList.contains('p-cluebox')) {
+    const clueEntries = printClueBoxMap[key] || [];
+    if (!clueEntries.length) return '';
+    return `<div class="tt-header">Clue box (${r}, ${c})</div>` +
+      clueEntries.map(entryHtml).join('');
+  }
+
+  if (cellEl.classList.contains('p-black')) return '';
+
+  // Letter cell
+  const g = puzzle.grid;
+  const ch = g[r * puzzle.width + c];
+  const isTheme = cellEl.classList.contains('p-theme');
+  const themeBadge = isTheme ? '<span class="tt-theme-badge">THEME</span>' : '';
+  const header = `<div class="tt-header">Cell (${r}, ${c}) — <strong>${ch}</strong> ${themeBadge}</div>`;
+  const ents = cellEntries[key] || [];
+  return header + ents.map(entryHtml).join('');
+}
+
+(function initPrintTooltip() {
+  const grid = document.getElementById('print-grid');
+  const tooltip = document.getElementById('cell-tooltip');
+
+  grid.addEventListener('mousemove', (e) => {
+    if (!puzzle) { tooltip.style.display = 'none'; return; }
+    const cell = e.target.closest('.p-cell');
+    if (!cell || !('r' in cell.dataset)) { tooltip.style.display = 'none'; return; }
+
+    const html = buildPrintTooltipHtml(+cell.dataset.r, +cell.dataset.c, cell);
+    if (!html) { tooltip.style.display = 'none'; return; }
+
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+
+    const pad = 14;
+    const tw = 290, th = 180; // estimated bounds
+    let tx = e.clientX + pad;
+    let ty = e.clientY + pad;
+    if (tx + tw > window.innerWidth) tx = e.clientX - tw - pad;
+    if (ty + th > window.innerHeight) ty = e.clientY - th - pad;
+    tooltip.style.left = tx + 'px';
+    tooltip.style.top = ty + 'px';
+  });
+
+  grid.addEventListener('mouseleave', () => {
+    tooltip.style.display = 'none';
+  });
+})();
+</script>
+</body>
+</html>
