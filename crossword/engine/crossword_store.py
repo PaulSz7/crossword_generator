@@ -165,6 +165,8 @@ class CrosswordStore:
                 entry["hint_1"] = clue.hint_1
             if clue and clue.hint_2:
                 entry["hint_2"] = clue.hint_2
+            if slot.word_breaks:
+                entry["word_breaks"] = list(slot.word_breaks)
             entries.append(entry)
         return entries
 

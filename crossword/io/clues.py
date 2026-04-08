@@ -290,7 +290,7 @@ DIFFICULTY: {{DIFFICULTY}}
 WORD LIST (JSON array):
 {{WORD_LIST_JSON}}
 
-{{DEFINITIONS_SECTION}}{{PRESET_CLUES_SECTION}}{{SIBLING_ENTRIES_SECTION}}Requirements:
+{{DEFINITIONS_SECTION}}{{PRESET_CLUES_SECTION}}{{SIBLING_ENTRIES_SECTION}}{{SAFETY_SECTION}}Requirements:
 - Return one clue object for each input word.
 - Preserve the original answer exactly in the "answer" field.
 - Keep the same order as the input list.
@@ -338,7 +338,7 @@ class ClueGenerator(Protocol):
     """Protocol for clue generation backends."""
     def generate(self, requests: List[ClueRequest],
                  difficulty: str = "MEDIUM", language: str = "Romanian",
-                 theme: str = "") -> Dict[str, ClueBundle]:
+                 theme: str = "", allow_adult: bool = False) -> Dict[str, ClueBundle]:
         """Return mapping from slot_id to ClueBundle."""
 
 
@@ -374,7 +374,7 @@ class GeminiClueGenerator:
 
     def generate(self, requests: List[ClueRequest],
                  difficulty: str = "MEDIUM", language: str = "Romanian",
-                 theme: str = "") -> Dict[str, ClueBundle]:  # pragma: no cover - external
+                 theme: str = "", allow_adult: bool = False) -> Dict[str, ClueBundle]:  # pragma: no cover - external
         """Generate clue bundles for all requests via Gemini."""
         if not requests:
             return {}
@@ -386,7 +386,7 @@ class GeminiClueGenerator:
             answer_to_slots.setdefault(word_upper, []).append(req.slot_id)
 
         word_list = list(answer_to_slots.keys())
-        prompt = self._render_prompt(word_list, difficulty, language, theme, requests)
+        prompt = self._render_prompt(word_list, difficulty, language, theme, requests, allow_adult=allow_adult)
         system_instruction = _build_system_instruction(language, difficulty)
 
         client = self._get_client()
@@ -455,7 +455,8 @@ class GeminiClueGenerator:
     @staticmethod
     def _render_prompt(word_list: List[str], difficulty: str,
                        language: str, theme: str,
-                       requests: Optional[List[ClueRequest]] = None) -> str:
+                       requests: Optional[List[ClueRequest]] = None,
+                       allow_adult: bool = False) -> str:
         """Fill the main prompt template with concrete values."""
         word_list_json = json.dumps(word_list, ensure_ascii=False)
 
@@ -517,6 +518,14 @@ class GeminiClueGenerator:
                     + "\n\n"
                 )
 
+        safety_section = ""
+        if not allow_adult:
+            safety_section = (
+                "ADDITIONAL CONTENT POLICY:\n"
+                "Reject any answer word that refers to anatomy, bodily functions, "
+                "or content unsuitable for a family-friendly context.\n\n"
+            )
+
         return (
             MAIN_PROMPT_TEMPLATE
             .replace("{{LANGUAGE}}", language)
@@ -526,6 +535,7 @@ class GeminiClueGenerator:
             .replace("{{DEFINITIONS_SECTION}}", definitions_section)
             .replace("{{PRESET_CLUES_SECTION}}", preset_clues_section)
             .replace("{{SIBLING_ENTRIES_SECTION}}", sibling_section)
+            .replace("{{SAFETY_SECTION}}", safety_section)
         )
 
     @staticmethod
@@ -682,7 +692,7 @@ class TemplateClueGenerator:
 
     def generate(self, requests: List[ClueRequest],
                  difficulty: str = "MEDIUM", language: str = "Romanian",
-                 theme: str = "") -> Dict[str, ClueBundle]:
+                 theme: str = "", allow_adult: bool = False) -> Dict[str, ClueBundle]:
         """Return template-based ClueBundle for each request."""
         results: Dict[str, ClueBundle] = {}
         for req in requests:

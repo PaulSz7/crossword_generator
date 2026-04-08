@@ -57,6 +57,7 @@ DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "max_iterations": 8000,
     "fill_timeout_seconds": 75.0,
     "difficulty": "EASY",
+    "allow_multi_word": False,
     "place_blocker_zone": True,
     # "blocker_zone_height": None,
     # "blocker_zone_width": None,
@@ -121,6 +122,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         "prefer_theme_candidates": bool,
         "difficulty": str,
         "language": str,
+        "allow_multi_word": bool,
         "place_blocker_zone": bool,
         "blocker_zone_height": int,
         "blocker_zone_width": int,
@@ -138,7 +140,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
     prompt_log = PromptLog()
     definition_store = DefinitionStore()
     gemini_client = GeminiClient(prompt_log=prompt_log)
-    dex_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
+    definition_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
 
     # Wire up theme generators (same logic as main.py)
     theme_gen = None
@@ -146,22 +148,23 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
 
     if theme_type == "words_containing_substring":
         if user_words:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
         # theme_gen=None when no user words → SubstringGen becomes primary in _seed_theme_words
         fallbacks = []  # no LLM/dummy fallbacks; extension controlled by extend_with_substring flag
 
     elif theme_type in ("joke_continuation", "custom"):
         if user_words and not use_llm:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
             fallbacks = []
         elif user_words and use_llm:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
             fallbacks = [
                 GeminiThemeWordGenerator(
                     theme_type=theme_type,
                     theme_description=theme_description,
                     cache=theme_cache,
                     prompt_log=prompt_log,
+                    allow_multi_word=config.allow_multi_word,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
@@ -171,13 +174,14 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
                 theme_description=theme_description,
                 cache=theme_cache,
                 prompt_log=prompt_log,
+                allow_multi_word=config.allow_multi_word,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
     else:
         # domain_specific_words (default)
         if user_words:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
             if use_llm:
                 fallbacks = [
                     GeminiThemeWordGenerator(
@@ -185,6 +189,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
                         theme_description=theme_description,
                         cache=theme_cache,
                         prompt_log=prompt_log,
+                        allow_multi_word=config.allow_multi_word,
                     ),
                     DummyThemeWordGenerator(seed=config.seed),
                 ]
@@ -196,6 +201,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
                 theme_description=theme_description,
                 cache=theme_cache,
                 prompt_log=prompt_log,
+                allow_multi_word=config.allow_multi_word,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
         # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
@@ -209,7 +215,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         clue_generator=clue_gen,
         store=crossword_store,
         theme_cache=theme_cache,
-        dex_fetcher=dex_fetcher,
+        definition_fetcher=definition_fetcher,
     )
     grid_seed = generator.rng.randint(0, 1_000_000)
     grid = CrosswordGrid(config.to_grid_config(seed_override=grid_seed))

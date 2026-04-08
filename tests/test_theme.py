@@ -661,11 +661,139 @@ class GeminiPromptTemplateTests(unittest.TestCase):
             {"word": "ZEUS", "clue": "Rege", "long_clue": "Cel mai mare.", "hint": "Pista."},
             {"word": "HERA", "clue": "Regina", "long_clue": "Sotia regelui.", "hint": "Altceva."},
         ]
-        entries = GeminiThemeWordGenerator._build_theme_words(dicts)
+        gen = GeminiThemeWordGenerator(theme_type="domain_specific_words")
+        entries = gen._build_theme_words(dicts)
         self.assertEqual(len(entries), 2)
         self.assertEqual(entries[0].word, "ZEUS")
         self.assertEqual(entries[0].source, "gemini")
         self.assertEqual(entries[1].clue, "Regina")
+
+
+class MultiWordTests(unittest.TestCase):
+    """Tests for multi-word word slot support."""
+
+    def test_extract_word_breaks_simple(self) -> None:
+        from crossword.data.normalization import extract_word_breaks
+        self.assertEqual(extract_word_breaks("DE FACTO"), (2,))
+
+    def test_extract_word_breaks_multiple_spaces(self) -> None:
+        from crossword.data.normalization import extract_word_breaks
+        self.assertEqual(extract_word_breaks("A LA CARTE"), (1, 3))
+
+    def test_extract_word_breaks_no_spaces(self) -> None:
+        from crossword.data.normalization import extract_word_breaks
+        self.assertEqual(extract_word_breaks("ZEUS"), ())
+
+    def test_extract_word_breaks_with_diacritics(self) -> None:
+        from crossword.data.normalization import extract_word_breaks
+        # "ÎN FAȚĂ" → diacritics replaced: "IN FATA" → space at index 2
+        self.assertEqual(extract_word_breaks("ÎN FAȚĂ"), (2,))
+
+    def test_extract_word_breaks_empty(self) -> None:
+        from crossword.data.normalization import extract_word_breaks
+        self.assertEqual(extract_word_breaks(""), ())
+
+    def test_display_form_roundtrip(self) -> None:
+        from crossword.data.normalization import display_form, extract_word_breaks, clean_word
+        original = "DE FACTO"
+        breaks = extract_word_breaks(original)
+        surface = clean_word(original)
+        self.assertEqual(surface, "DEFACTO")
+        self.assertEqual(display_form(surface, breaks), "DE FACTO")
+
+    def test_display_form_multiple_breaks(self) -> None:
+        from crossword.data.normalization import display_form, extract_word_breaks, clean_word
+        original = "A LA CARTE"
+        breaks = extract_word_breaks(original)
+        surface = clean_word(original)
+        self.assertEqual(surface, "ALACARTE")
+        self.assertEqual(display_form(surface, breaks), "A LA CARTE")
+
+    def test_display_form_no_breaks(self) -> None:
+        from crossword.data.normalization import display_form
+        self.assertEqual(display_form("ZEUS", ()), "ZEUS")
+
+    def test_user_generator_multi_word_with_clue(self) -> None:
+        gen = UserWordListGenerator(["DE FACTO:în realitate"], allow_multi_word=True)
+        output = gen.generate("test")
+        self.assertEqual(len(output.words), 1)
+        tw = output.words[0]
+        self.assertEqual(tw.word, "DEFACTO")
+        self.assertEqual(tw.word_breaks, (2,))
+        self.assertTrue(tw.has_user_clue)
+
+    def test_user_generator_multi_word_no_clue(self) -> None:
+        gen = UserWordListGenerator(["A LA CARTE"], allow_multi_word=True)
+        output = gen.generate("test")
+        tw = output.words[0]
+        self.assertEqual(tw.word, "ALACARTE")
+        self.assertEqual(tw.word_breaks, (1, 3))
+        self.assertFalse(tw.has_user_clue)
+
+    def test_user_generator_flag_off_strips_breaks(self) -> None:
+        gen = UserWordListGenerator(["DE FACTO"], allow_multi_word=False)
+        output = gen.generate("test")
+        tw = output.words[0]
+        self.assertEqual(tw.word, "DEFACTO")
+        self.assertEqual(tw.word_breaks, ())
+
+    def test_validate_accepts_multi_word_when_allowed(self) -> None:
+        entry = {
+            "word": "DE FACTO",
+            "clue": "Real",
+            "long_clue": "In realitate.",
+            "hint": "Gandeste-te la adevar.",
+        }
+        valid, repair = _validate_theme_words([entry], allow_multi_word=True)
+        self.assertEqual(len(valid), 1)
+        self.assertEqual(len(repair), 0)
+
+    def test_validate_rejects_multi_word_when_disallowed(self) -> None:
+        entry = {
+            "word": "DE FACTO",
+            "clue": "Real",
+            "long_clue": "In realitate.",
+            "hint": "Gandeste-te la adevar.",
+        }
+        valid, repair = _validate_theme_words([entry], allow_multi_word=False)
+        self.assertEqual(len(valid), 0)
+        self.assertEqual(len(repair), 1)
+
+    def test_theme_word_default_breaks_empty(self) -> None:
+        tw = ThemeWord(word="ZEUS", clue="Rege")
+        self.assertEqual(tw.word_breaks, ())
+
+    def test_word_slot_default_breaks_empty(self) -> None:
+        from crossword.core.models import WordSlot
+        from crossword.core.constants import Direction
+        slot = WordSlot(
+            id="AC_0_0", start_row=0, start_col=0,
+            direction=Direction.ACROSS, length=5, clue_box=(0, 0),
+        )
+        self.assertEqual(slot.word_breaks, ())
+
+    def test_gemini_build_theme_words_extracts_breaks(self) -> None:
+        gen = GeminiThemeWordGenerator(
+            theme_type="domain_specific_words", allow_multi_word=True,
+        )
+        dicts = [
+            {"word": "DE FACTO", "clue": "Real", "long_clue": "In realitate.", "hint": "Pista."},
+        ]
+        entries = gen._build_theme_words(dicts)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].word, "DEFACTO")
+        self.assertEqual(entries[0].word_breaks, (2,))
+
+    def test_gemini_build_theme_words_no_breaks_when_disabled(self) -> None:
+        gen = GeminiThemeWordGenerator(
+            theme_type="domain_specific_words", allow_multi_word=False,
+        )
+        dicts = [
+            {"word": "DE FACTO", "clue": "Real", "long_clue": "In realitate.", "hint": "Pista."},
+        ]
+        entries = gen._build_theme_words(dicts)
+        self.assertEqual(entries[0].word, "DEFACTO")
+        self.assertEqual(entries[0].word_breaks, ())
 
 
 if __name__ == "__main__":  # pragma: no cover

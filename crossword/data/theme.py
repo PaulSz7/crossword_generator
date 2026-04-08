@@ -15,6 +15,7 @@ from ..core.constants import Difficulty
 from ..io.gemini_client import GeminiClient
 from ..io.prompt_log import PromptLog
 from ..utils.logger import get_logger
+from .normalization import clean_word, extract_word_breaks
 
 if TYPE_CHECKING:
     from .dictionary import WordDictionary
@@ -41,6 +42,7 @@ class ThemeWord:
     long_clue: str = ""
     hint: str = ""
     has_user_clue: bool = False
+    word_breaks: Tuple[int, ...] = ()
 
 
 @dataclass
@@ -296,6 +298,7 @@ def _is_severe_theme_violation(violation: str) -> bool:
 
 def _validate_theme_words(
     words: List[Dict],
+    allow_multi_word: bool = False,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Split theme word entries into valid and needs-repair lists.
 
@@ -303,11 +306,18 @@ def _validate_theme_words(
     are accepted as valid. Only entries with severe violations (missing fields,
     invalid word format, duplicates, answer leaking) are flagged for repair.
 
+    Args:
+        words: Raw word dicts from the LLM response.
+        allow_multi_word: When True, spaces are permitted in the word field.
+
     Returns (valid, needs_repair) where each needs_repair entry has a ``violations`` key.
     """
     valid: List[Dict] = []
     needs_repair: List[Dict] = []
     seen_words: Set[str] = set()
+
+    # When multi-word is allowed, validate on the cleaned (space-stripped) form
+    word_pattern = re.compile(r'^[A-Z]{2,}$') if not allow_multi_word else re.compile(r'^[A-Z][A-Z ]*[A-Z]$')
 
     for entry in words:
         all_violations: List[str] = []
@@ -320,13 +330,17 @@ def _validate_theme_words(
         if not word or not clue or not long_clue or not hint:
             all_violations.append("missing required field(s)")
 
-        # Word format
-        word_upper = word.upper() if word else ""
-        if word_upper and not re.match(r'^[A-Z]{2,}$', word_upper):
+        # Word format — validate the cleaned surface when multi-word is allowed
+        word_upper = word.upper().strip() if word else ""
+        cleaned_upper = clean_word(word) if word else ""
+        if word_upper and not word_pattern.match(word_upper):
             all_violations.append(f"word '{word}' is not valid uppercase A-Z with 2+ letters")
+        elif cleaned_upper and len(cleaned_upper) < 2:
+            all_violations.append(f"word '{word}' is too short (needs 2+ letters after cleaning)")
 
-        # Duplicate check
-        if word_upper in seen_words:
+        # Duplicate check (on cleaned surface to catch "DE FACTO" == "DEFACTO")
+        dedup_key = cleaned_upper or word_upper
+        if dedup_key in seen_words:
             all_violations.append(f"duplicate word '{word}'")
 
         # Clue word count
@@ -343,16 +357,18 @@ def _validate_theme_words(
         if hint_sentences > 2:
             all_violations.append(f"hint exceeds 2 phrases ({hint_sentences} sentences)")
 
-        # Answer leaking check
+        # Answer leaking check — check both spaced and flat forms
         word_lower = word.lower() if word else ""
-        if word_lower and len(word_lower) >= 2:
+        cleaned_lower = cleaned_upper.lower()
+        if word_lower and len(cleaned_lower) >= 2:
             for field_name, field_val in [("clue", clue), ("long_clue", long_clue), ("hint", hint)]:
-                if word_lower in field_val.lower():
+                val_lower = field_val.lower()
+                if word_lower in val_lower or (cleaned_lower != word_lower and cleaned_lower in val_lower):
                     all_violations.append(f"{field_name} contains the answer '{word}'")
 
         if not all_violations:
             valid.append(entry)
-            seen_words.add(word_upper)
+            seen_words.add(dedup_key)
         elif any(_is_severe_theme_violation(v) for v in all_violations):
             entry_copy = dict(entry)
             entry_copy["violations"] = all_violations
@@ -368,7 +384,7 @@ def _validate_theme_words(
                 word, "; ".join(all_violations),
             )
             valid.append(entry)
-            seen_words.add(word_upper)
+            seen_words.add(dedup_key)
 
     return valid, needs_repair
 
@@ -415,6 +431,7 @@ class GeminiThemeWordGenerator:
         cache: Optional["ThemeCache"] = None,
         gemini_client: Optional[GeminiClient] = None,
         prompt_log: Optional[PromptLog] = None,
+        allow_multi_word: bool = False,
     ) -> None:
         """Initialize with optional pre-built client and cache."""
         resolved_model = os.environ.get(model_env, model_name)
@@ -426,6 +443,7 @@ class GeminiThemeWordGenerator:
         self.cache = cache
         self._client = gemini_client
         self._prompt_log = prompt_log
+        self.allow_multi_word = allow_multi_word
 
     def _get_client(self) -> GeminiClient:
         """Return the cached client or create a new one."""
@@ -474,7 +492,7 @@ class GeminiThemeWordGenerator:
         raw_words, crossword_title, content = parsed
 
         # Validate and repair only for severe violations
-        valid, needs_repair = _validate_theme_words(raw_words)
+        valid, needs_repair = _validate_theme_words(raw_words, allow_multi_word=self.allow_multi_word)
         LOGGER.info(
             "Theme word validation: %d/%d entries valid, %d need repair",
             len(valid), len(raw_words), len(needs_repair),
@@ -496,7 +514,9 @@ class GeminiThemeWordGenerator:
             repaired = self._parse_response(repair_text, self.theme_type)
             if repaired is not None:
                 repaired_words, _, _ = repaired
-                repaired_valid, still_invalid = _validate_theme_words(repaired_words)
+                repaired_valid, still_invalid = _validate_theme_words(
+                    repaired_words, allow_multi_word=self.allow_multi_word,
+                )
                 valid.extend(repaired_valid)
                 if still_invalid:
                     LOGGER.warning(
@@ -548,6 +568,14 @@ class GeminiThemeWordGenerator:
         if self.theme_description:
             description_line = f"Additional context: {self.theme_description}"
 
+        multi_word_line = ""
+        if self.allow_multi_word:
+            multi_word_line = (
+                "\nMulti-word entries are allowed. You may return expressions or phrases "
+                "with spaces (e.g., 'DE FACTO', 'A LA CARTE'). "
+                "The word field may contain spaces between letter groups."
+            )
+
         return (
             THEME_PROMPT_TEMPLATE
             .replace("{{LANGUAGE}}", language)
@@ -556,7 +584,7 @@ class GeminiThemeWordGenerator:
             .replace("{{MIN_WORDS}}", str(min_words))
             .replace("{{MAX_WORDS}}", str(max_words))
             .replace("{{TYPE_INSTRUCTIONS}}", type_instructions)
-            .replace("{{DESCRIPTION_LINE}}", description_line)
+            .replace("{{DESCRIPTION_LINE}}", description_line + multi_word_line)
         )
 
     def _build_response_schema(self, limit: int) -> Dict[str, Any]:
@@ -620,8 +648,7 @@ class GeminiThemeWordGenerator:
 
         return words_data, crossword_title, content
 
-    @staticmethod
-    def _build_theme_words(word_dicts: List[Dict]) -> List[ThemeWord]:
+    def _build_theme_words(self, word_dicts: List[Dict]) -> List[ThemeWord]:
         """Convert validated word dicts into ThemeWord objects."""
         entries: List[ThemeWord] = []
         for item in word_dicts:
@@ -633,13 +660,16 @@ class GeminiThemeWordGenerator:
             hint = item.get("hint") or item.get("smart_hint") or ""
             if not isinstance(word, str) or not word.strip():
                 continue
+            raw_word = word.strip()
+            breaks = extract_word_breaks(raw_word) if self.allow_multi_word else ()
             entries.append(
                 ThemeWord(
-                    word=word.strip().upper(),
+                    word=clean_word(raw_word),
                     clue=clue.strip() if isinstance(clue, str) else "",
                     source="gemini",
                     long_clue=long_clue.strip() if isinstance(long_clue, str) else "",
                     hint=hint.strip() if isinstance(hint, str) else "",
+                    word_breaks=breaks,
                 )
             )
         return entries
@@ -717,38 +747,38 @@ class SubstringThemeWordGenerator:
 class UserWordListGenerator:
     """Returns a user-supplied list of words as ThemeWord objects."""
 
-    def __init__(self, raw_words: List[str]) -> None:
+    def __init__(self, raw_words: List[str], allow_multi_word: bool = False) -> None:
         self._theme_words: List[ThemeWord] = []
         for item in raw_words:
             item = item.strip()
             if not item:
                 continue
             if ":" in item:
-                word, _, clue = item.partition(":")
-                word_clean = word.strip().upper()
+                word_raw, _, clue = item.partition(":")
+                word_raw = word_raw.strip()
                 clue_text = clue.strip()
                 has_user_clue = bool(clue_text)
-                self._theme_words.append(
-                    ThemeWord(
-                        word_clean,
-                        self._derive_short_clue(clue_text, word_clean),
-                        "user",
-                        long_clue=self._derive_long_clue(clue_text, word_clean),
-                        hint=self._derive_hint(clue_text, word_clean),
-                        has_user_clue=has_user_clue,
-                    )
-                )
             else:
-                word_clean = item.upper()
-                self._theme_words.append(
-                    ThemeWord(
-                        word_clean,
-                        self._derive_short_clue("", word_clean),
-                        "user",
-                        long_clue=self._derive_long_clue("", word_clean),
-                        hint=self._derive_hint("", word_clean),
-                    )
+                word_raw = item
+                clue_text = ""
+                has_user_clue = False
+
+            breaks = extract_word_breaks(word_raw) if allow_multi_word else ()
+            word_clean = clean_word(word_raw)
+            if not word_clean:
+                continue
+
+            self._theme_words.append(
+                ThemeWord(
+                    word_clean,
+                    self._derive_short_clue(clue_text, word_clean),
+                    "user",
+                    long_clue=self._derive_long_clue(clue_text, word_clean),
+                    hint=self._derive_hint(clue_text, word_clean),
+                    has_user_clue=has_user_clue,
+                    word_breaks=breaks,
                 )
+            )
 
     def generate(
         self, theme: str, limit: int = 80,

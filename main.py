@@ -112,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Logging level (DEBUG, INFO, WARNING, ERROR)",
     )
     parser.add_argument(
+        "--allow-multi-word",
+        action="store_true",
+        help="Allow multi-word expressions in a single word slot (e.g. 'DE FACTO')",
+    )
+    parser.add_argument(
         "--no-blocker-zone",
         action="store_true",
         help="Disable BLOCKER_ZONE placement",
@@ -199,6 +204,7 @@ def main(argv: list[str] | None = None) -> None:
         blocker_zone_width=args.blocker_zone_width,
         blocker_zone_row=args.blocker_zone_row,
         blocker_zone_col=args.blocker_zone_col,
+        allow_multi_word=args.allow_multi_word,
     )
 
     # Initialise persistent stores
@@ -207,7 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     prompt_log = PromptLog()
     definition_store = DefinitionStore()
     gemini_client = GeminiClient(prompt_log=prompt_log)
-    dex_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
+    definition_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
 
     # Wire up generators based on mode
     theme_gen = None
@@ -220,21 +226,22 @@ def main(argv: list[str] | None = None) -> None:
         # SubstringThemeWordGenerator is always wired inside _seed_theme_words.
         # extend_with_substring (set above) tells it whether to extend user words from the dictionary.
         if user_words:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
         # theme_gen=None when no user words → SubstringGen becomes primary in _seed_theme_words
         fallbacks = []  # no LLM/dummy fallbacks for this type
 
     elif theme_type == "joke_continuation":
         if user_words and not args.llm:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
             fallbacks = []
         elif user_words and args.llm:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
             fallbacks = [
                 GeminiThemeWordGenerator(
                     theme_type=theme_type,
                     theme_description=args.theme_description,
                     cache=theme_cache,
+                    allow_multi_word=config.allow_multi_word,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
@@ -244,6 +251,7 @@ def main(argv: list[str] | None = None) -> None:
                 theme_description=args.theme_description,
                 cache=theme_cache,
                 prompt_log=prompt_log,
+                allow_multi_word=config.allow_multi_word,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -252,13 +260,14 @@ def main(argv: list[str] | None = None) -> None:
             theme_type=theme_type,
             theme_description=args.theme_description,
             cache=theme_cache,
+            allow_multi_word=config.allow_multi_word,
         )
         fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
     else:
         # domain_specific_words (default)
         if user_words:
-            theme_gen = UserWordListGenerator(user_words)
+            theme_gen = UserWordListGenerator(user_words, allow_multi_word=config.allow_multi_word)
             if args.llm:
                 fallbacks = [
                     GeminiThemeWordGenerator(
@@ -266,6 +275,7 @@ def main(argv: list[str] | None = None) -> None:
                         theme_description=args.theme_description,
                         cache=theme_cache,
                         prompt_log=prompt_log,
+                        allow_multi_word=config.allow_multi_word,
                     ),
                     DummyThemeWordGenerator(seed=config.seed),
                 ]
@@ -277,6 +287,7 @@ def main(argv: list[str] | None = None) -> None:
                 theme_description=args.theme_description,
                 cache=theme_cache,
                 prompt_log=prompt_log,
+                allow_multi_word=config.allow_multi_word,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
         # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
@@ -290,7 +301,7 @@ def main(argv: list[str] | None = None) -> None:
         clue_generator=clue_gen,
         store=crossword_store,
         theme_cache=theme_cache,
-        dex_fetcher=dex_fetcher,
+        definition_fetcher=definition_fetcher,
     )
     result = generator.generate()
 
@@ -308,6 +319,7 @@ def main(argv: list[str] | None = None) -> None:
                 "text": slot.text,
                 "clue_box": list(slot.clue_box),
                 "is_theme": slot.is_theme,
+                **({"word_breaks": list(slot.word_breaks)} if slot.word_breaks else {}),
             }
             for slot in result.slots
         ],

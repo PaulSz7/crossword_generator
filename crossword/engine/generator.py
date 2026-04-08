@@ -63,6 +63,8 @@ class GeneratorConfig:
     blocker_zone_width: Optional[int] = None
     blocker_zone_row: Optional[int] = None
     blocker_zone_col: Optional[int] = None
+    allow_adult: bool = False
+    allow_multi_word: bool = False
 
     def to_grid_config(self, seed_override: Optional[int] = None) -> GridConfig:
         blocker_seed = self._manual_blocker_seed()
@@ -83,6 +85,7 @@ class GeneratorConfig:
             path=self.dictionary_path,
             rng=random.Random(self.seed),
             difficulty=Difficulty(self.difficulty),
+            allow_compounds=self.allow_multi_word,
         )
 
     def _manual_blocker_seed(self) -> Optional[int]:
@@ -141,7 +144,7 @@ class CrosswordGenerator:
         theme_fallback_generators: Optional[List[ThemeWordGenerator]] = None,
         store: Optional[CrosswordStore] = None,
         theme_cache: Optional[ThemeCache] = None,
-        dex_fetcher: Optional[GeminiDefinitionFetcher] = None,
+        definition_fetcher: Optional[GeminiDefinitionFetcher] = None,
     ) -> None:
         self.config = config
         self.rng = random.Random(config.seed)
@@ -156,7 +159,7 @@ class CrosswordGenerator:
         self.validator = GridValidator(self.dictionary)
         self.store = store
         self.theme_cache = theme_cache
-        self.dex_fetcher = dex_fetcher
+        self.definition_fetcher = definition_fetcher
         self.used_words: Set[str] = set()
         self.remaining_theme_words: Set[str] = set()
         self.theme_word_surfaces: Set[str] = set()
@@ -220,13 +223,13 @@ class CrosswordGenerator:
                         )
                     ]
                     fetched_defs: Dict[str, str] = {}
-                    if words_needing_def and self.dex_fetcher:
+                    if words_needing_def and self.definition_fetcher:
                         LOGGER.info(
                             "Fetching definitions for %d word(s) via DEX: %s",
                             len(words_needing_def),
                             ", ".join(words_needing_def),
                         )
-                        fetched_defs = self.dex_fetcher.fetch_batch(words_needing_def)
+                        fetched_defs = self.definition_fetcher.fetch_batch(words_needing_def)
 
                     # Categorize slots: fill words go to LLM, theme words use existing clues
                     clue_requests: List[ClueRequest] = []
@@ -301,6 +304,7 @@ class CrosswordGenerator:
                         clue_requests, difficulty=self.config.difficulty,
                         language=self.config.language,
                         theme=self.config.theme_title or "",
+                        allow_adult=self.config.allow_adult,
                     )
                     attach_clues_to_grid(grid, slots, {**clue_texts, **theme_bundles})
                     LOGGER.info("Crossword generation completed with %s words", len(slots))
@@ -515,6 +519,7 @@ class CrosswordGenerator:
             length=len(word),
             clue_box=clue_box,
             is_theme=is_theme,
+            word_breaks=theme_entry.word_breaks if theme_entry else (),
         )
 
         try:

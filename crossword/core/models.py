@@ -51,6 +51,7 @@ class WordSlot:
     clue_box: Tuple[int, int]
     text: Optional[str] = None
     is_theme: bool = False
+    word_breaks: Tuple[int, ...] = ()
     _cells: Optional[List[Tuple[int, int]]] = field(default=None, repr=False, compare=False)
 
     @property
