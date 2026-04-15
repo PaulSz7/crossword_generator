@@ -35,6 +35,7 @@ FIELDNAMES = (
     "definition_count",
     "source_count",
     "difficulty_score",
+    "is_adult",
 )
 
 
@@ -407,6 +408,7 @@ class ProcessedWordRecord:
     definition_count: int = 0
     source_count: int = 0
     difficulty_score: float = 0.0
+    is_adult: bool = False
 
 
 def preprocess_dictionary(
@@ -439,8 +441,7 @@ def preprocess_dictionary(
     with source.open("r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
         for row in reader:
-            if _parse_bool(row.get("is_adult")):
-                continue
+            row_is_adult = _parse_bool(row.get("is_adult"))
             raw_entry = (row.get("entry_word") or "").strip()
             if not raw_entry or not all(c in _VALID_WORD_CHARS for c in raw_entry):
                 continue
@@ -482,6 +483,7 @@ def preprocess_dictionary(
                     frequency=frequency,
                     is_compound=is_compound,
                     is_stopword=is_stopword,
+                    is_adult=row_is_adult,
                     raw_forms=set(),
                     source_name=best_src,
                     tags=tags,
@@ -497,6 +499,7 @@ def preprocess_dictionary(
                 record.raw_forms.add(raw_entry)
             record.is_compound = record.is_compound or is_compound
             record.is_stopword = record.is_stopword or is_stopword
+            record.is_adult = record.is_adult or row_is_adult
             # Merge tags from all rows (ObjectTags + inline paren register markers)
             new_tags: set[str] = set()
             if tags:
@@ -619,6 +622,7 @@ def write_processed_dictionary(records: Iterable[ProcessedWordRecord], destinati
                     "definition_count": record.definition_count,
                     "source_count": record.source_count,
                     "difficulty_score": f"{record.difficulty_score:.6f}",
+                    "is_adult": "1" if record.is_adult else "0",
                 }
             )
 
@@ -665,6 +669,7 @@ def load_processed_dictionary(path: Path | str) -> List[ProcessedWordRecord]:
                     definition_count=definition_count,
                     source_count=source_count,
                     difficulty_score=difficulty_score,
+                    is_adult=_parse_bool(row.get("is_adult")),
                 )
             )
     return records

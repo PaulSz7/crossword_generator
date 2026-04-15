@@ -34,8 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate Romanian cryptic barred crosswords",
     )
-    parser.add_argument("--height", type=int, required=True, help="Grid height in cells")
-    parser.add_argument("--width", type=int, required=True, help="Grid width in cells")
+    parser.add_argument("--height", type=int, help="Grid height in cells")
+    parser.add_argument("--width", type=int, help="Grid width in cells")
     parser.add_argument("--theme-title", type=str, default="", help="Theme title / keyword")
     parser.add_argument(
         "--theme-type",
@@ -104,6 +104,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Generate LLM clues via Gemini (requires GEMINI_API_KEY)",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        metavar="DOC_ID",
+        help="Resume clue generation from a filled checkpoint document ID (skips theme/fill/validation)",
+    )
     parser.add_argument("--output", type=Path, help="Optional path to JSON output")
     parser.add_argument(
         "--log-level",
@@ -115,6 +121,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-multi-word",
         action="store_true",
         help="Allow multi-word expressions in a single word slot (e.g. 'DE FACTO')",
+    )
+    parser.add_argument(
+        "--allow-repair",
+        action="store_true",
+        help="Allow LLM repair calls for invalid theme/clue entries (default: drop invalid entries)",
+    )
+    parser.add_argument(
+        "--no-strict-user-words",
+        action="store_true",
+        help="Apply the same strict crossing thresholds to user words as LLM words (default: soft thresholds for user words)",
     )
     parser.add_argument(
         "--no-blocker-zone",
@@ -149,6 +165,52 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     level = getattr(logging, args.log_level.upper(), logging.INFO)
     configure_logging(level)
+
+    # ------------------------------------------------------------------
+    # Resume from a filled checkpoint — skip all layout/fill work
+    # ------------------------------------------------------------------
+    if args.resume:
+        from debug_main import resume_from_filled
+        resume_overrides: Dict[str, Any] = {}
+        if args.difficulty:
+            resume_overrides["difficulty"] = args.difficulty
+        if args.language:
+            resume_overrides["language"] = args.language
+        if hasattr(args, "allow_adult") and args.allow_adult:
+            resume_overrides["allow_adult"] = True
+        if args.dictionary:
+            resume_overrides["dictionary_path"] = str(args.dictionary)
+        result = resume_from_filled(args.resume, **resume_overrides)
+
+        payload: Dict[str, Any] = {
+            "crossword_title": result.crossword_title,
+            "theme_content": result.theme_content,
+            "grid": result.grid.to_jsonable(),
+            "theme_words": [tw.__dict__ for tw in result.theme_words],
+            "slots": [
+                {
+                    "id": slot.id,
+                    "start": [slot.start_row, slot.start_col],
+                    "direction": slot.direction.value,
+                    "length": slot.length,
+                    "text": slot.text,
+                    "clue_box": list(slot.clue_box),
+                    "is_theme": slot.is_theme,
+                    **({"word_breaks": list(slot.word_breaks)} if slot.word_breaks else {}),
+                }
+                for slot in result.slots
+            ],
+            "validation": result.validation_messages,
+        }
+        output_text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if args.output:
+            args.output.write_text(output_text, encoding="utf-8")
+        else:
+            print(output_text)
+        return
+
+    if args.height is None or args.width is None:
+        parser.error("--height and --width are required when not using --resume")
 
     override_fields = [
         args.blocker_zone_height,
@@ -205,6 +267,8 @@ def main(argv: list[str] | None = None) -> None:
         blocker_zone_row=args.blocker_zone_row,
         blocker_zone_col=args.blocker_zone_col,
         allow_multi_word=args.allow_multi_word,
+        allow_repair=args.allow_repair,
+        strict_user_words=not args.no_strict_user_words,
     )
 
     # Initialise persistent stores
@@ -242,6 +306,7 @@ def main(argv: list[str] | None = None) -> None:
                     theme_description=args.theme_description,
                     cache=theme_cache,
                     allow_multi_word=config.allow_multi_word,
+                    allow_repair=config.allow_repair,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
@@ -252,6 +317,7 @@ def main(argv: list[str] | None = None) -> None:
                 cache=theme_cache,
                 prompt_log=prompt_log,
                 allow_multi_word=config.allow_multi_word,
+                allow_repair=config.allow_repair,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -261,6 +327,7 @@ def main(argv: list[str] | None = None) -> None:
             theme_description=args.theme_description,
             cache=theme_cache,
             allow_multi_word=config.allow_multi_word,
+            allow_repair=config.allow_repair,
         )
         fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -276,6 +343,7 @@ def main(argv: list[str] | None = None) -> None:
                         cache=theme_cache,
                         prompt_log=prompt_log,
                         allow_multi_word=config.allow_multi_word,
+                        allow_repair=config.allow_repair,
                     ),
                     DummyThemeWordGenerator(seed=config.seed),
                 ]
@@ -288,11 +356,12 @@ def main(argv: list[str] | None = None) -> None:
                 cache=theme_cache,
                 prompt_log=prompt_log,
                 allow_multi_word=config.allow_multi_word,
+                allow_repair=config.allow_repair,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
         # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
 
-    clue_gen = GeminiClueGenerator(prompt_log=prompt_log) if args.clues else None
+    clue_gen = GeminiClueGenerator(prompt_log=prompt_log, allow_repair=config.allow_repair) if args.clues else None
 
     generator = CrosswordGenerator(
         config,

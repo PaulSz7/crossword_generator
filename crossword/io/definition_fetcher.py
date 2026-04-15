@@ -1,18 +1,22 @@
-"""Batch-fetch word definitions from an online dictionary via grounded Gemini.
+"""Definition fetcher interface and Gemini-grounded implementation.
 
 Handles two cases:
 - Word absent from the local DB entirely.
 - Word present but definition is truncated (ends with ellipsis due to copyright).
+
+The DefinitionFetcher ABC is the shared interface. Swap implementations by
+constructing a different subclass — no changes needed in the generator pipeline.
 """
 
 from __future__ import annotations
 
 import json
+from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
 from ..data.definition_store import DefinitionStore
 from ..utils.logger import get_logger
-from .gemini_client import GeminiClient
+from .gemini_client import GeminiClient, GeminiUnavailableError
 
 LOGGER = get_logger(__name__)
 
@@ -39,21 +43,40 @@ def is_incomplete_definition(definition: str) -> bool:
     )
 
 
+class DefinitionFetcher(ABC):  # noqa: B024
+    """Abstract interface for batch definition fetching.
+
+    Implementations are interchangeable: the generator pipeline only depends on
+    fetch_batch(). Swap by constructing a different subclass.
+    """
+
+    @abstractmethod
+    def fetch_batch(self, words: List[str]) -> Dict[str, str]:
+        """Return a mapping of word → definition for all resolvable words.
+
+        Words with no available definition are omitted from the result.
+        Words of length ≤ 2 are always skipped.
+        """
+
+
 _SYSTEM_TEMPLATE = (
     "You are a linguistics assistant. "
     "Look up the definition of each word on {dictionary_url} "
-    'and return a JSON object {{"WORD": "definition"}} with no other text.'
+    'and return a JSON object {{"WORD": "definition"}} with no other text. '
+    "If a word is not found on {dictionary_url}, set its value to null."
 )
 
 _PROMPT_TEMPLATE = (
     "Look up the exact {language} definitions (with grammatical indicators) "
     "for each word below on {dictionary_url}. "
-    'Return ONLY a JSON object {{"WORD": "definition"}}.\n\n'
+    "If a word does not have a page or definition on {dictionary_url}, "
+    "return null for that word — do NOT write an explanation or placeholder phrase. "
+    'Return ONLY a JSON object {{"WORD": "definition or null"}}.\n\n'
     "{words}"
 )
 
 
-class GeminiDefinitionFetcher:
+class GeminiDefinitionFetcher(DefinitionFetcher):
     """Batch-fetches word definitions from an online dictionary via one grounded Gemini call."""
 
     def __init__(
@@ -76,6 +99,8 @@ class GeminiDefinitionFetcher:
         """
         uncached: List[str] = []
         for w in words:
+            if len(w) <= 2:
+                continue
             key = w.upper()
             if key in self._session_cache:
                 continue
@@ -92,21 +117,41 @@ class GeminiDefinitionFetcher:
                 dictionary_url=self._dictionary_url,
                 words="\n".join(w.upper() for w in uncached),
             )
+            raw: Optional[str] = None
             try:
-                raw = self._client.generate_text_grounded(prompt, system_instruction=system, request_type="definition_fetch")
-                # Strip markdown code fences if present
-                raw = raw.strip()
-                if raw.startswith("```"):
-                    raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-                parsed: Dict = json.loads(raw)
-                for w in uncached:
-                    defn: Optional[str] = parsed.get(w.upper()) or None
-                    self._session_cache[w.upper()] = defn
-                    if defn:
-                        self._store.save(w, defn)
-                        LOGGER.info("Fetched and stored definition for %s", w.upper())
+                raw = self._client.generate_text_grounded(
+                    prompt, system_instruction=system, request_type="definition_fetch"
+                )
+            except GeminiUnavailableError as exc:
+                LOGGER.warning(
+                    "Grounded definition lookup unavailable (%s); retrying without grounding", exc
+                )
+                try:
+                    raw = self._client.generate_text(
+                        prompt, system_instruction=system, request_type="definition_fetch"
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    LOGGER.warning("Definition lookup fallback also failed: %s", exc2)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Grounded definition lookup failed: %s", exc)
+
+            if raw is not None:
+                try:
+                    raw = raw.strip()
+                    if raw.startswith("```"):
+                        raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                    parsed: Dict = json.loads(raw)
+                    for w in uncached:
+                        defn: Optional[str] = parsed.get(w.upper()) or None
+                        self._session_cache[w.upper()] = defn
+                        if defn:
+                            self._store.save(w, defn)
+                            LOGGER.info("Fetched and stored definition for %s", w.upper())
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Failed to parse definition response: %s", exc)
+                    for w in uncached:
+                        self._session_cache[w.upper()] = None
+            else:
                 for w in uncached:
                     self._session_cache[w.upper()] = None
 
@@ -115,3 +160,28 @@ class GeminiDefinitionFetcher:
             for w in words
             if self._session_cache.get(w.upper())
         }
+
+
+class FallbackDefinitionFetcher(DefinitionFetcher):
+    """Chains a primary and a backup fetcher.
+
+    Calls the primary for all words first. Any words not resolved by the
+    primary are forwarded to the backup fetcher.
+
+    Typical usage: DictApiDefinitionFetcher (primary) → GeminiDefinitionFetcher (backup).
+    """
+
+    def __init__(self, primary: DefinitionFetcher, backup: DefinitionFetcher) -> None:
+        self._primary = primary
+        self._backup = backup
+
+    def fetch_batch(self, words: List[str]) -> Dict[str, str]:
+        results = self._primary.fetch_batch(words)
+        missing = [w for w in words if w not in results]
+        if missing:
+            LOGGER.debug(
+                "Primary fetcher resolved %d/%d words; forwarding %d to backup",
+                len(results), len(words), len(missing),
+            )
+            results.update(self._backup.fetch_batch(missing))
+        return results

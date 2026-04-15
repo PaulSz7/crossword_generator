@@ -34,6 +34,7 @@ class DictionaryConfig:
     persist_processed_cache: bool = True
     rng: Optional[random.Random] = None
     difficulty: Difficulty = Difficulty.MEDIUM
+    allow_adult: bool = False
 
 
 _TIER_CENTER = {Difficulty.EASY: 0.15, Difficulty.MEDIUM: 0.45, Difficulty.HARD: 0.80}
@@ -134,6 +135,8 @@ class WordDictionary:
             if self.config.exclude_stopwords and record.is_stopword:
                 continue
             if record.is_compound and not self.config.allow_compounds:
+                continue
+            if record.is_adult and not self.config.allow_adult:
                 continue
 
             entry = WordEntry(

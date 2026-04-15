@@ -29,12 +29,15 @@ from crossword.engine.generator import CrosswordGenerator, GeneratorConfig, Cros
 from crossword.engine.grid import CrosswordGrid
 from crossword.engine.crossword_store import CrosswordStore
 from crossword.data.definition_store import DefinitionStore
+from crossword.data.dictionary import DictionaryConfig, WordDictionary
+from crossword.core.constants import Difficulty
 from crossword.data.preprocess import ensure_processed_dictionary
-from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, UserWordListGenerator, ThemeType
+from crossword.data.theme import DummyThemeWordGenerator, GeminiThemeWordGenerator, ThemeWord, UserWordListGenerator, ThemeType
 from crossword.data.theme_cache import ThemeCache
-from crossword.io.clues import ClueRequest, GeminiClueGenerator, attach_clues_to_grid
-from crossword.io.definition_fetcher import GeminiDefinitionFetcher
-from crossword.io.gemini_client import GeminiClient
+from crossword.io.clues import ClueBundle, ClueRequest, GeminiClueGenerator, attach_clues_to_grid
+from crossword.io.definition_fetcher import FallbackDefinitionFetcher, GeminiDefinitionFetcher, is_incomplete_definition
+from crossword.io.dict_api_fetcher import DictApiDefinitionFetcher
+from crossword.io.gemini_client import GeminiClient, GeminiUnavailableError
 from crossword.io.prompt_log import PromptLog
 from crossword.utils.logger import configure_logging
 from crossword.utils.pretty import pretty_print_grid, print_crossword_stats
@@ -58,6 +61,8 @@ DEFAULT_DEBUG_ARGS: Dict[str, Any] = {
     "fill_timeout_seconds": 75.0,
     "difficulty": "EASY",
     "allow_multi_word": False,
+    "allow_repair": False,
+    "strict_user_words": True,
     "place_blocker_zone": True,
     # "blocker_zone_height": None,
     # "blocker_zone_width": None,
@@ -123,6 +128,8 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
         "difficulty": str,
         "language": str,
         "allow_multi_word": bool,
+        "allow_repair": bool,
+        "strict_user_words": bool,
         "place_blocker_zone": bool,
         "blocker_zone_height": int,
         "blocker_zone_width": int,
@@ -140,7 +147,11 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
     prompt_log = PromptLog()
     definition_store = DefinitionStore()
     gemini_client = GeminiClient(prompt_log=prompt_log)
-    definition_fetcher = GeminiDefinitionFetcher(client=gemini_client, store=definition_store)
+    # DictApi is primary (direct HTTP, no quota); Gemini grounded is backup.
+    definition_fetcher = FallbackDefinitionFetcher(
+        primary=DictApiDefinitionFetcher(store=definition_store),
+        backup=GeminiDefinitionFetcher(client=gemini_client, store=definition_store),
+    )
 
     # Wire up theme generators (same logic as main.py)
     theme_gen = None
@@ -165,6 +176,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
                     cache=theme_cache,
                     prompt_log=prompt_log,
                     allow_multi_word=config.allow_multi_word,
+                    allow_repair=config.allow_repair,
                 ),
                 DummyThemeWordGenerator(seed=config.seed),
             ]
@@ -175,6 +187,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
                 cache=theme_cache,
                 prompt_log=prompt_log,
                 allow_multi_word=config.allow_multi_word,
+                allow_repair=config.allow_repair,
             )
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
 
@@ -206,7 +219,7 @@ def prepare_state(**overrides: Any) -> Dict[str, Any]:
             fallbacks = [DummyThemeWordGenerator(seed=config.seed)]
         # else: theme_gen stays None → CrosswordGenerator uses default [DummyThemeWordGenerator]
 
-    clue_gen = GeminiClueGenerator(prompt_log=prompt_log) if bool(args.get("clues", False)) else None
+    clue_gen = GeminiClueGenerator(prompt_log=prompt_log, allow_repair=config.allow_repair) if bool(args.get("clues", False)) else None
 
     generator = CrosswordGenerator(
         config,
@@ -262,6 +275,9 @@ def step_seed_theme(state: Dict[str, Any], retries: int = 3):
         try:
             state["theme_words"] = generator._seed_theme_words(state["grid"])
             return state["theme_words"]
+        except GeminiUnavailableError:
+            LOGGER.warning("Gemini unavailable — aborting theme retries")
+            raise ThemeWordError("Gemini API unavailable")
         except ThemeWordError as exc:
             LOGGER.warning(
                 "Theme seeding attempt %s/%s failed: %s",
@@ -306,10 +322,11 @@ def step_clues(state: Dict[str, Any]):
     state["slots"] = list(state["grid"].word_slots.values())
     slots = state["slots"]
 
-    # Fetch definitions for words missing or with truncated local definitions
+    # Fetch definitions for words missing or with truncated local definitions.
+    # Skip 2-letter words — they use free-form letter combos and have no DEX entry.
     words_needing_def = [
         slot.text for slot in slots
-        if slot.text and (
+        if slot.text and len(slot.text) >= 3 and (
             (e := generator.dictionary.get(slot.text)) is None
             or is_incomplete_definition(e.definition or "")
         )
@@ -368,6 +385,10 @@ def run_debug(**overrides: Any) -> CrosswordResult:
     Saves exactly one document to CrosswordStore per call — either the
     successful result or a failure record after all attempts are exhausted.
     """
+
+    resume_from = overrides.pop("resume_from", None)
+    if resume_from:
+        return resume_from_filled(str(resume_from), **overrides)
 
     max_runs = int(overrides.pop("max_runs", 15))
     theme_retries = int(overrides.pop("theme_retries", 5))
@@ -471,6 +492,10 @@ def run_debug(**overrides: Any) -> CrosswordResult:
                         attempt_kwargs.get("seed"),
                     )
                     break
+                except GeminiUnavailableError as exc:
+                    LOGGER.error("Gemini unavailable — aborting all attempts: %s", exc)
+                    _save_failure(exc)
+                    raise
                 except (ThemeWordError, CrosswordError) as exc:
                     LOGGER.warning(
                         "Attempt %s/%s failed with seed %s: %s",
@@ -505,6 +530,7 @@ def _run_single_attempt(
     """
     state = prepare_state(**attempt_overrides)
     generator: CrosswordGenerator = state["generator"]
+    store: CrosswordStore = state["store"]
     try:
         step_seed_theme(state, retries=theme_retries)
         pretty_print_grid(state['grid'])
@@ -513,7 +539,30 @@ def _run_single_attempt(
         if validation and not validation.ok:
             pretty_print_grid(state['grid'])
             raise CrosswordError(f"Validation failed: {validation.messages}")
-        step_clues(state)
+
+        # Save a filled checkpoint before clue generation so the expensive
+        # fill work can be resumed if definition fetching or clues fail.
+        filled_doc_id = store.save_filled(
+            state["grid"],
+            state["config"],
+            list(state["grid"].word_slots.values()),
+            theme_words=state["theme_words"],
+            crossword_title=generator._theme_crossword_title,
+            theme_content=generator._theme_content,
+            dictionary=generator.dictionary,
+            theme_cache_ref=generator._theme_cache_ref,
+        )
+        state["filled_doc_id"] = filled_doc_id
+
+        try:
+            step_clues(state)
+        except Exception:
+            LOGGER.error(
+                "Clue generation failed — resume with doc_id: %s",
+                filled_doc_id,
+            )
+            raise
+
         result = build_result(state)
         print_crossword_stats(result, generator.dictionary)
         return result, state
@@ -521,6 +570,200 @@ def _run_single_attempt(
         if _capture_state is not None:
             _capture_state.update(state)
         raise
+
+
+def resume_from_filled(doc_id: str, **overrides: Any) -> CrosswordResult:
+    """Resume clue generation from a previously saved filled checkpoint.
+
+    Loads the grid and theme words from a ``status: "filled"`` document,
+    re-initialises the dictionary and clue generator, then runs clue
+    generation and saves the final result as a success document.
+
+    Args:
+        doc_id: The document ID of the filled checkpoint.
+        **overrides: Optional overrides (e.g. ``allow_adult``, ``difficulty``).
+
+    Returns:
+        The completed ``CrosswordResult`` with clues attached.
+    """
+    configure_logging()
+    store = CrosswordStore()
+    doc = store.load(doc_id)
+
+    if doc.get("status") != "filled":
+        raise ValueError(
+            f"Document {doc_id} has status '{doc.get('status')}', expected 'filled'"
+        )
+
+    # Apply overrides on top of saved values
+    language = overrides.get("language", doc.get("language", "Romanian"))
+    allow_adult = overrides.get("allow_adult", doc.get("allow_adult", False))
+    difficulty = overrides.get("difficulty", doc.get("difficulty", "MEDIUM"))
+    dictionary_path = Path(overrides.get("dictionary_path", doc.get("dictionary_path", "local_db/dex_words.tsv")))
+
+    # Reconstruct grid
+    grid = CrosswordGrid.from_entries(
+        width=doc["width"],
+        height=doc["height"],
+        entries=doc["entries"],
+        blocker_zone=doc.get("blocker_zone"),
+    )
+    pretty_print_grid(grid)
+
+    slots = list(grid.word_slots.values())
+
+    # Reconstruct ThemeWord list from saved metadata
+    theme_words: List[ThemeWord] = []
+    for tw_dict in doc.get("theme_words") or []:
+        theme_words.append(ThemeWord(
+            word=tw_dict["word"],
+            clue=tw_dict["clue"],
+            source=tw_dict.get("source", "unknown"),
+            long_clue=tw_dict.get("long_clue", ""),
+            hint=tw_dict.get("hint", ""),
+            has_user_clue=tw_dict.get("has_user_clue", False),
+            word_breaks=tuple(tw_dict.get("word_breaks", ())),
+        ))
+
+    # Init dictionary
+    processed_path = ensure_processed_dictionary(
+        dictionary_path,
+        dictionary_path.with_name(f"{dictionary_path.stem}_processed{dictionary_path.suffix}"),
+    )
+    LOGGER.info("Using processed dictionary cache at %s", processed_path)
+    dict_config = DictionaryConfig(path=dictionary_path, difficulty=Difficulty(difficulty), allow_adult=allow_adult)
+    dictionary = WordDictionary(dict_config)
+
+    # Init Gemini client and definition fetcher (DictApi primary, Gemini backup)
+    prompt_log = PromptLog()
+    definition_store = DefinitionStore()
+    gemini_client = GeminiClient(prompt_log=prompt_log)
+    definition_fetcher = FallbackDefinitionFetcher(
+        primary=DictApiDefinitionFetcher(store=definition_store),
+        backup=GeminiDefinitionFetcher(client=gemini_client, store=definition_store),
+    )
+
+    # Fetch definitions for words missing or with truncated local definitions.
+    # Skip 2-letter words — they use free-form letter combos and have no DEX entry.
+    words_needing_def = [
+        slot.text for slot in slots
+        if slot.text and len(slot.text) >= 3 and (
+            (e := dictionary.get(slot.text)) is None
+            or is_incomplete_definition(e.definition or "")
+        )
+    ]
+    fetched_defs: Dict[str, str] = {}
+    if words_needing_def and definition_fetcher:
+        LOGGER.info(
+            "Fetching definitions for %d word(s): %s",
+            len(words_needing_def),
+            ", ".join(words_needing_def),
+        )
+        fetched_defs = definition_fetcher.fetch_batch(words_needing_def)
+
+    # Build theme word lookup: sanitized surface → ThemeWord
+    theme_word_map = {dictionary.sanitize(tw.word): tw for tw in theme_words}
+
+    # Categorize slots: fill words go to LLM, theme words use existing clues
+    clue_requests: List[ClueRequest] = []
+    theme_bundles: Dict[str, ClueBundle] = {}
+
+    for slot in slots:
+        word = slot.text or ""
+        if not slot.is_theme:
+            entry = dictionary.get(word)
+            clue_requests.append(ClueRequest(
+                slot_id=slot.id,
+                word=word,
+                direction=slot.direction.value,
+                clue_box=slot.clue_box,
+                definition=fetched_defs.get(word) or (entry.definition if entry else None),
+            ))
+        else:
+            tw = theme_word_map.get(word)
+            if tw is None:
+                clue_requests.append(ClueRequest(
+                    slot_id=slot.id,
+                    word=word,
+                    direction=slot.direction.value,
+                    clue_box=slot.clue_box,
+                ))
+            elif tw.source == "gemini":
+                theme_bundles[slot.id] = ClueBundle(
+                    main_clue=tw.clue,
+                    hint_1=tw.long_clue or "",
+                    hint_2=tw.hint or "",
+                )
+            elif tw.has_user_clue:
+                entry = dictionary.get(word)
+                clue_requests.append(ClueRequest(
+                    slot_id=slot.id,
+                    word=word,
+                    direction=slot.direction.value,
+                    clue_box=slot.clue_box,
+                    definition=fetched_defs.get(word) or (entry.definition if entry else None),
+                    preset_main_clue=tw.clue,
+                ))
+            else:
+                entry = dictionary.get(word)
+                clue_requests.append(ClueRequest(
+                    slot_id=slot.id,
+                    word=word,
+                    direction=slot.direction.value,
+                    clue_box=slot.clue_box,
+                    definition=fetched_defs.get(word) or (entry.definition if entry else None),
+                ))
+
+    # Detect sibling entry pairs: slots sharing the same (row, col) start
+    start_pos_map: Dict[Tuple[int, int], list] = {}
+    for slot in slots:
+        start_pos_map.setdefault((slot.start_row, slot.start_col), []).append(slot)
+    for req in clue_requests:
+        slot_match = grid.word_slots.get(req.slot_id)
+        if slot_match is None:
+            continue
+        siblings = start_pos_map.get((slot_match.start_row, slot_match.start_col), [])
+        sibling = next((s for s in siblings if s.id != req.slot_id and s.text), None)
+        if sibling:
+            req.sibling_word = sibling.text
+
+    # Generate clues
+    allow_repair = overrides.get("allow_repair", False)
+    clue_gen = GeminiClueGenerator(prompt_log=prompt_log, allow_repair=allow_repair)
+    theme_title = doc.get("theme_title", "")
+    clue_texts = clue_gen.generate(
+        clue_requests,
+        difficulty=difficulty,
+        language=language,
+        theme=theme_title,
+        allow_adult=allow_adult,
+    )
+    attach_clues_to_grid(grid, slots, {**clue_texts, **theme_bundles})
+
+    result = CrosswordResult(
+        grid=grid,
+        slots=slots,
+        theme_words=theme_words,
+        validation_messages=[],
+        seed=doc.get("seed"),
+        crossword_title=doc.get("title"),
+        theme_content=doc.get("theme_content"),
+    )
+    print_crossword_stats(result, dictionary)
+
+    # Save as success
+    config = GeneratorConfig(
+        height=doc["height"],
+        width=doc["width"],
+        dictionary_path=dictionary_path,
+        theme_title=theme_title,
+        difficulty=difficulty,
+        language=language,
+        allow_adult=allow_adult,
+    )
+    store.update_to_success(result=result, config=config, dictionary=dictionary, theme_cache_ref=doc.get("theme_cache_ref"), doc_id=doc_id)
+    LOGGER.info("Resumed crossword updated in-place from filled checkpoint %s", doc_id)
+    return result
 
 
 def main() -> None:  # pragma: no cover - manual helper

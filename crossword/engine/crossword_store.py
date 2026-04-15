@@ -50,28 +50,33 @@ class CrosswordStore:
         """Persist a successful crossword result and return its document ID."""
         doc_id = self._new_id()
         now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        doc = {
-            "id": doc_id,
-            "created_at": now,
-            "status": "success",
-            "title": result.crossword_title,
-            "theme_content": result.theme_content,
-            "width": config.width,
-            "height": config.height,
-            "difficulty": config.difficulty,
-            "theme_title": config.theme_title,
-            "seed": result.seed,
-            "grid": self._encode_grid_string(result.grid),
-            "entries": self._build_entries(result.grid, result.slots),
-            "blocker_zone": list(result.grid.blocker_zone) if result.grid.blocker_zone else None,
-            "stats": self._compute_compact_stats(result.slots, dictionary),
-            "theme_cache_ref": theme_cache_ref,
-        }
-
+        doc = self._build_success_doc(doc_id, now, result, config, dictionary, theme_cache_ref)
         path = self.store_dir / f"{doc_id}.json"
         path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.info("Crossword saved: %s", doc_id)
+        return doc_id
+
+    def update_to_success(
+        self,
+        doc_id: str,
+        result: "CrosswordResult",
+        config: "GeneratorConfig",
+        dictionary: Optional["WordDictionary"] = None,
+        theme_cache_ref: Optional[str] = None,
+    ) -> str:
+        """Overwrite an existing document (e.g. a filled checkpoint) with a success result.
+
+        Preserves the original ``id`` and ``created_at`` so the document
+        identity stays stable across resume attempts.
+        """
+        path = self.store_dir / f"{doc_id}.json"
+        if not path.exists():
+            raise FileNotFoundError(f"No crossword document found: {doc_id}")
+        original = json.loads(path.read_text(encoding="utf-8"))
+        created_at = original.get("created_at", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        doc = self._build_success_doc(doc_id, created_at, result, config, dictionary, theme_cache_ref)
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOGGER.info("Crossword updated to success: %s", doc_id)
         return doc_id
 
     def save_failure(
@@ -109,6 +114,81 @@ class CrosswordStore:
         path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
         LOGGER.info("Crossword failure saved: %s", doc_id)
         return doc_id
+
+    def save_filled(
+        self,
+        grid: "CrosswordGrid",
+        config: "GeneratorConfig",
+        slots: List["WordSlot"],
+        theme_words: Optional[List["ThemeWord"]] = None,
+        crossword_title: Optional[str] = None,
+        theme_content: Optional[str] = None,
+        dictionary: Optional["WordDictionary"] = None,
+        theme_cache_ref: Optional[str] = None,
+    ) -> str:
+        """Persist a filled grid checkpoint (pre-clue) and return its document ID.
+
+        Saved after a successful fill + validation but before clue generation,
+        so the expensive fill work can be resumed if clue generation fails.
+        """
+        doc_id = self._new_id()
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        entries = self._build_entries(grid, slots)
+        # Strip clue fields — grid is filled but clues haven't been generated yet
+        for entry in entries:
+            entry["clue"] = None
+            entry.pop("hint_1", None)
+            entry.pop("hint_2", None)
+
+        tw_array = None
+        if theme_words:
+            tw_array = [
+                {
+                    "word": tw.word,
+                    "clue": tw.clue,
+                    "source": tw.source,
+                    "long_clue": tw.long_clue,
+                    "hint": tw.hint,
+                    "has_user_clue": tw.has_user_clue,
+                    "word_breaks": list(tw.word_breaks) if tw.word_breaks else [],
+                }
+                for tw in theme_words
+            ]
+
+        doc = {
+            "id": doc_id,
+            "created_at": now,
+            "status": "filled",
+            "title": crossword_title,
+            "theme_content": theme_content,
+            "width": config.width,
+            "height": config.height,
+            "difficulty": config.difficulty,
+            "theme_title": config.theme_title,
+            "seed": None,  # grid seed not tracked at config level
+            "language": config.language,
+            "allow_adult": config.allow_adult,
+            "dictionary_path": str(config.dictionary_path),
+            "grid": self._encode_grid_string(grid),
+            "entries": entries,
+            "blocker_zone": list(grid.blocker_zone) if grid.blocker_zone else None,
+            "stats": self._compute_compact_stats(slots, dictionary),
+            "theme_words": tw_array,
+            "theme_cache_ref": theme_cache_ref,
+        }
+
+        path = self.store_dir / f"{doc_id}.json"
+        path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOGGER.info("Filled checkpoint saved: %s", doc_id)
+        return doc_id
+
+    def load(self, doc_id: str) -> dict:
+        """Load a stored document by ID. Raises FileNotFoundError if missing."""
+        path = self.store_dir / f"{doc_id}.json"
+        if not path.exists():
+            raise FileNotFoundError(f"No crossword document found: {doc_id}")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -208,6 +288,52 @@ class CrosswordStore:
                 stats["hard_pct"] = round(hard_n / total, 3)
 
         return stats
+
+    def _build_success_doc(
+        self,
+        doc_id: str,
+        created_at: str,
+        result: "CrosswordResult",
+        config: "GeneratorConfig",
+        dictionary: Optional["WordDictionary"],
+        theme_cache_ref: Optional[str],
+    ) -> dict:
+        """Build the JSON-serialisable dict for a success document."""
+        tw_array = None
+        if result.theme_words:
+            tw_array = [
+                {
+                    "word": tw.word,
+                    "clue": tw.clue,
+                    "source": tw.source,
+                    "long_clue": tw.long_clue,
+                    "hint": tw.hint,
+                    "has_user_clue": tw.has_user_clue,
+                    "word_breaks": list(tw.word_breaks) if tw.word_breaks else [],
+                }
+                for tw in result.theme_words
+            ]
+        return {
+            "id": doc_id,
+            "created_at": created_at,
+            "status": "success",
+            "title": result.crossword_title,
+            "theme_content": result.theme_content,
+            "width": config.width,
+            "height": config.height,
+            "difficulty": config.difficulty,
+            "theme_title": config.theme_title,
+            "seed": result.seed,
+            "language": config.language,
+            "allow_adult": config.allow_adult,
+            "dictionary_path": str(config.dictionary_path),
+            "grid": self._encode_grid_string(result.grid),
+            "entries": self._build_entries(result.grid, result.slots),
+            "blocker_zone": list(result.grid.blocker_zone) if result.grid.blocker_zone else None,
+            "stats": self._compute_compact_stats(result.slots, dictionary),
+            "theme_words": tw_array,
+            "theme_cache_ref": theme_cache_ref,
+        }
 
     @staticmethod
     def _new_id() -> str:

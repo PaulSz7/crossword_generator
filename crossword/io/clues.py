@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Set, Tuple
@@ -347,27 +346,27 @@ class GeminiClueGenerator:
 
     def __init__(
         self,
-        model_name: str = "gemini-2.5-flash",
         api_key_env: str = "GEMINI_API_KEY",
-        model_env: str = "GEMINI_MODEL",
         gemini_client: GeminiClient | None = None,
         prompt_log: PromptLog | None = None,
+        allow_repair: bool = False,
     ) -> None:
-        """Initialize with optional pre-built client."""
-        resolved_model = os.environ.get(model_env, model_name)
-        self.model_name = resolved_model
+        """Initialize with optional pre-built client.
+
+        Args:
+            allow_repair: When True, send a repair LLM call for invalid entries.
+                When False (default), invalid entries are silently dropped.
+        """
         self.api_key_env = api_key_env
-        self.model_env = model_env
         self._client = gemini_client
         self._prompt_log = prompt_log
+        self.allow_repair = allow_repair
 
     def _get_client(self) -> GeminiClient:
         """Return the cached client or create a new one."""
         if self._client is None:
             self._client = GeminiClient(
-                model_name=self.model_name,
                 api_key_env=self.api_key_env,
-                model_env=self.model_env,
                 prompt_log=self._prompt_log,
             )
         return self._client
@@ -408,28 +407,35 @@ class GeminiClueGenerator:
             len(valid), len(parsed), len(needs_repair),
         )
         if needs_repair:
-            LOGGER.warning(
-                "Sending repair request for %d clue entries: %s",
-                len(needs_repair),
-                ", ".join(e.get("answer", "?") for e in needs_repair),
-            )
-            repair_prompt = _build_repair_prompt(needs_repair, language, theme, difficulty)
-            repair_text = client.generate_text(
-                repair_prompt,
-                system_instruction=system_instruction,
-                response_schema=CLUE_RESPONSE_SCHEMA,
-                request_type="clue_repair",
-            )
-            repaired = self._parse_response(repair_text)
-            if repaired is not None:
-                repaired_valid, still_invalid = _validate_clues(repaired, set(word_list))
-                valid.extend(repaired_valid)
-                if still_invalid:
-                    LOGGER.warning(
-                        "After repair, %d clue entries still invalid (dropping): %s",
-                        len(still_invalid),
-                        ", ".join(e.get("answer", "?") for e in still_invalid),
-                    )
+            if self.allow_repair:
+                LOGGER.warning(
+                    "Sending repair request for %d clue entries: %s",
+                    len(needs_repair),
+                    ", ".join(e.get("answer", "?") for e in needs_repair),
+                )
+                repair_prompt = _build_repair_prompt(needs_repair, language, theme, difficulty)
+                repair_text = client.generate_text(
+                    repair_prompt,
+                    system_instruction=system_instruction,
+                    response_schema=CLUE_RESPONSE_SCHEMA,
+                    request_type="clue_repair",
+                )
+                repaired = self._parse_response(repair_text)
+                if repaired is not None:
+                    repaired_valid, still_invalid = _validate_clues(repaired, set(word_list))
+                    valid.extend(repaired_valid)
+                    if still_invalid:
+                        LOGGER.warning(
+                            "After repair, %d clue entries still invalid (dropping): %s",
+                            len(still_invalid),
+                            ", ".join(e.get("answer", "?") for e in still_invalid),
+                        )
+            else:
+                LOGGER.warning(
+                    "Repair disabled — dropping %d invalid clue entries: %s",
+                    len(needs_repair),
+                    ", ".join(e.get("answer", "?") for e in needs_repair),
+                )
 
         # Build preset_main_clue lookup: word_upper → preset clue
         preset_clues: Dict[str, str] = {}

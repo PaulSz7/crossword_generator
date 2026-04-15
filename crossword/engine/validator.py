@@ -33,6 +33,7 @@ class GridValidator:
             self._check_clue_boxes(grid)
             self._check_no_clue_box_in_bottom_right(grid)
             self._check_no_isolated_cells(grid)
+            self._check_no_unfilled_runs(grid)
             self._check_no_duplicate_words(grid)
             self._check_letters_valid(grid)
             self._check_sequences(grid, theme_words or set())
@@ -95,6 +96,38 @@ class GridValidator:
                 )
                 if not has_playable:
                     raise ValidationError(f"Isolated unreachable cell at ({r},{c})")
+
+    def _check_no_unfilled_runs(self, grid: CrosswordGrid) -> None:
+        """Ensure no two adjacent EMPTY_PLAYABLE cells form an unfilled run.
+
+        A run of ≥2 consecutive EMPTY_PLAYABLE cells means a slot was never filled
+        (e.g. skipped during CP-SAT because its clue box was over-subscribed).
+        Such runs are invisible to _check_sequences, which only scans LETTER cells.
+        Only the run-start is reported to avoid duplicate errors per run.
+        """
+        for r in range(grid.bounds.rows):
+            for c in range(grid.bounds.cols):
+                cell = grid.cell(r, c)
+                if cell.type != CellType.EMPTY_PLAYABLE:
+                    continue
+                # Report ACROSS run-start: no EMPTY_PLAYABLE to the left, but one to the right
+                left_empty = (
+                    c > 0 and grid.cell(r, c - 1).type == CellType.EMPTY_PLAYABLE
+                )
+                if not left_empty and c + 1 < grid.bounds.cols:
+                    if grid.cell(r, c + 1).type == CellType.EMPTY_PLAYABLE:
+                        raise ValidationError(
+                            f"Unfilled cell run at ({r},{c}) direction=ACROSS"
+                        )
+                # Report DOWN run-start: no EMPTY_PLAYABLE above, but one below
+                above_empty = (
+                    r > 0 and grid.cell(r - 1, c).type == CellType.EMPTY_PLAYABLE
+                )
+                if not above_empty and r + 1 < grid.bounds.rows:
+                    if grid.cell(r + 1, c).type == CellType.EMPTY_PLAYABLE:
+                        raise ValidationError(
+                            f"Unfilled cell run at ({r},{c}) direction=DOWN"
+                        )
 
     def _check_no_duplicate_words(self, grid: CrosswordGrid) -> None:
         slots = grid.enumerate_slots()

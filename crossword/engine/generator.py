@@ -7,6 +7,7 @@ Two-phase approach:
 
 from __future__ import annotations
 
+import math
 import random
 import time
 from collections import defaultdict
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from ..io.clues import ClueBundle, ClueGenerator, ClueRequest, TemplateClueGenerator, attach_clues_to_grid
-from ..io.definition_fetcher import GeminiDefinitionFetcher, is_incomplete_definition
+from ..io.definition_fetcher import DefinitionFetcher, is_incomplete_definition
 from ..core.constants import CellType, Difficulty, Direction, ORTHOGONAL_STEPS
 from ..data.dictionary import DictionaryConfig, WordDictionary, WordEntry
 from ..core.exceptions import (ClueBoxError, CrosswordError, SlotPlacementError,
@@ -65,6 +66,8 @@ class GeneratorConfig:
     blocker_zone_col: Optional[int] = None
     allow_adult: bool = False
     allow_multi_word: bool = False
+    allow_repair: bool = False
+    strict_user_words: bool = True
 
     def to_grid_config(self, seed_override: Optional[int] = None) -> GridConfig:
         blocker_seed = self._manual_blocker_seed()
@@ -144,7 +147,7 @@ class CrosswordGenerator:
         theme_fallback_generators: Optional[List[ThemeWordGenerator]] = None,
         store: Optional[CrosswordStore] = None,
         theme_cache: Optional[ThemeCache] = None,
-        definition_fetcher: Optional[GeminiDefinitionFetcher] = None,
+        definition_fetcher: Optional[DefinitionFetcher] = None,
     ) -> None:
         self.config = config
         self.rng = random.Random(config.seed)
@@ -209,15 +212,30 @@ class CrosswordGenerator:
                         )
                     slots = list(grid.word_slots.values())
 
+                    # Save a filled checkpoint before clue generation — if
+                    # definition fetching or clue generation fails, the
+                    # expensive fill work can be resumed later.
+                    filled_doc_id: Optional[str] = None
+                    if self.store:
+                        filled_doc_id = self.store.save_filled(
+                            grid, self.config, slots,
+                            theme_words=theme_words,
+                            crossword_title=self._theme_crossword_title,
+                            theme_content=self._theme_content,
+                            dictionary=self.dictionary,
+                            theme_cache_ref=self._theme_cache_ref,
+                        )
+
                     # Build theme word lookup: sanitized surface → ThemeWord
                     theme_word_map = {
                         self.dictionary.sanitize(tw.word): tw for tw in theme_words
                     }
 
-                    # Collect words missing or with truncated local definitions for batch lookup
+                    # Collect words missing or with truncated local definitions for batch lookup.
+                    # Skip 2-letter words — they use free-form letter combos and have no DEX entry.
                     words_needing_def = [
                         slot.text for slot in slots
-                        if slot.text and (
+                        if slot.text and len(slot.text) >= 3 and (
                             (e := self.dictionary.get(slot.text)) is None
                             or is_incomplete_definition(e.definition or "")
                         )
@@ -414,9 +432,16 @@ class CrosswordGenerator:
                     (letters_used / playable_cells) * 100 if playable_cells else 0,
                 )
                 break
+            # User words use soft crossing thresholds (>=1 candidate) by default
+            # to avoid rejecting placements too aggressively. When strict_user_words
+            # is False, user words get the same graduated thresholds as LLM words.
+            if theme_entry.source == "user" and self.config.strict_user_words:
+                override = 1
+            else:
+                override = None
             if not self._attempt_place_specific_word(
                 grid, cleaned, theme_entry, is_theme=True,
-                skip_crossing_validation=theme_entry.source == "user",
+                min_candidates_override=override,
             ):
                 continue
             placed.append(theme_entry)
@@ -456,13 +481,30 @@ class CrosswordGenerator:
         word: str,
         theme_entry: Optional[ThemeWord] = None,
         is_theme: bool = False,
-        skip_crossing_validation: bool = False,
+        min_candidates_override: Optional[int] = None,
     ) -> bool:
+        """Try to place *word* on the grid, preferring high-scoring positions.
+
+        For theme words, all valid positions are scored by crossing viability
+        and the top candidates are tried in order. For non-theme words, pending
+        starts are attempted first.
+
+        Args:
+            min_candidates_override: When set, crossing validation uses this
+                as the minimum candidate count for all crossing lengths instead
+                of the graduated defaults.
+        """
         # Pending starts chain words together — useful for fill but counter-productive
         # for theme seeding where words should be spread across the grid.
         if not is_theme:
-            if self._attempt_pending_start(grid, word, theme_entry, is_theme, skip_crossing_validation):
+            if self._attempt_pending_start(grid, word, theme_entry, is_theme,
+                                           min_candidates_override=min_candidates_override):
                 return True
+
+        if is_theme:
+            return self._scored_theme_placement(
+                grid, word, theme_entry, min_candidates_override,
+            )
 
         for _ in range(self.config.theme_placement_attempts):
             direction = self.rng.choice([Direction.ACROSS, Direction.DOWN])
@@ -472,10 +514,104 @@ class CrosswordGenerator:
             start_row, start_col = self.rng.choice(start_positions)
             if self._place_word_at(
                 grid, word, theme_entry, is_theme, direction, start_row, start_col,
-                skip_crossing_validation=skip_crossing_validation,
+                min_candidates_override=min_candidates_override,
             ):
                 return True
         return False
+
+    def _scored_theme_placement(
+        self,
+        grid: CrosswordGrid,
+        word: str,
+        theme_entry: Optional[ThemeWord],
+        min_candidates_override: Optional[int],
+    ) -> bool:
+        """Score all valid placements and try the best ones first.
+
+        Collects (direction, start_row, start_col) candidates for both
+        directions, scores each by perpendicular crossing viability, sorts
+        descending, and attempts the top positions.
+        """
+        scored_positions: List[Tuple[float, int, int, int, Direction]] = []
+        counter = 0
+        for direction in (Direction.ACROSS, Direction.DOWN):
+            start_positions = self._candidate_starts(grid, len(word), direction)
+            for start_row, start_col in start_positions:
+                if not self._can_place_word(grid, start_row, start_col, direction, word):
+                    continue
+                score = self._score_placement(grid, word, direction, start_row, start_col)
+                if score == float("-inf"):
+                    continue
+                scored_positions.append((score, counter, start_row, start_col, direction))
+                counter += 1
+
+        if not scored_positions:
+            return False
+
+        # Sort descending by score; tie-break by counter for determinism
+        scored_positions.sort(key=lambda t: (-t[0], t[1]))
+
+        top_n = min(10, len(scored_positions))
+        for score, _, start_row, start_col, direction in scored_positions[:top_n]:
+            LOGGER.debug(
+                "Trying theme placement for %s at (%d,%d) %s — score=%.2f",
+                word, start_row, start_col, direction.value, score,
+            )
+            if self._place_word_at(
+                grid, word, theme_entry, True, direction, start_row, start_col,
+                min_candidates_override=min_candidates_override,
+            ):
+                return True
+        return False
+
+    def _score_placement(
+        self,
+        grid: CrosswordGrid,
+        word: str,
+        direction: Direction,
+        start_row: int,
+        start_col: int,
+    ) -> float:
+        """Score a candidate placement by perpendicular crossing viability.
+
+        For each cell of the word, builds the perpendicular crossing signature
+        and counts dictionary candidates. Returns sum(log(count + 1)) across
+        crossings, or -inf if any crossing has zero candidates.
+        """
+        dr, dc = self._step(direction)
+        cross_dir = Direction.DOWN if direction == Direction.ACROSS else Direction.ACROSS
+        total_score = 0.0
+
+        for i, letter in enumerate(word):
+            row = start_row + dr * i
+            col = start_col + dc * i
+
+            existing = grid.cell(row, col).letter
+            if existing == letter:
+                # Cell already has the right letter — no new crossing constraint
+                continue
+
+            sig = self._build_signature(grid, row, col, cross_dir)
+            if sig is None or sig.length < 2:
+                continue
+
+            # Build the pattern for this crossing with the proposed letter placed
+            pattern: List[Optional[str]] = []
+            for cr, cc in sig.cells:
+                if (cr, cc) == (row, col):
+                    pattern.append(letter)
+                else:
+                    cell_letter = grid.cell(cr, cc).letter
+                    pattern.append(cell_letter if cell_letter else None)
+
+            count = self.dictionary.count_candidates(
+                sig.length, pattern, banned=self.used_words,
+            )
+            if count == 0:
+                return float("-inf")
+            total_score += math.log(count + 1)
+
+        return total_score
 
     def _attempt_pending_start(
         self,
@@ -483,12 +619,12 @@ class CrosswordGenerator:
         word: str,
         theme_entry: Optional[ThemeWord],
         is_theme: bool,
-        skip_crossing_validation: bool = False,
+        min_candidates_override: Optional[int] = None,
     ) -> bool:
         while self.pending_starts:
             _, _, (row, col, direction) = heapq.heappop(self.pending_starts)
             if self._place_word_at(grid, word, theme_entry, is_theme, direction, row, col,
-                                   skip_crossing_validation=skip_crossing_validation):
+                                   min_candidates_override=min_candidates_override):
                 return True
         return False
 
@@ -501,7 +637,7 @@ class CrosswordGenerator:
         direction: Direction,
         start_row: int,
         start_col: int,
-        skip_crossing_validation: bool = False,
+        min_candidates_override: Optional[int] = None,
     ) -> bool:
         if not self._can_place_word(grid, start_row, start_col, direction, word):
             return False
@@ -524,8 +660,7 @@ class CrosswordGenerator:
 
         try:
             grid.place_word(slot, word)
-            if not skip_crossing_validation:
-                self._validate_crossings(grid, slot)
+            self._validate_crossings(grid, slot, min_candidates_override=min_candidates_override)
             extension = grid.ensure_terminal_boundary(slot)
         except (ClueBoxError, SlotPlacementError) as exc:
             if slot.id in grid.word_slots:
@@ -764,13 +899,24 @@ class CrosswordGenerator:
             LOGGER.info("No unfilled slots; skipping CP-SAT")
             return
 
-        # Pre-resolve clue boxes and filter out unlicensable slots
+        # Pre-resolve clue boxes and filter out unlicensable slots.
+        # Track pending assignments per box so we don't exceed MAX_CLUES_PER_BOX
+        # within the same batch (ensure_clue_box only sees already-placed licenses).
         slot_clue_boxes: Dict[int, Tuple[int, int]] = {}
         licensable: List = []
+        pending_licenses: Dict[Tuple[int, int], int] = {}
         for sig in unfilled:
             try:
                 cb = grid.ensure_clue_box(sig.start_row, sig.start_col, sig.direction)
+                existing = len(grid.clue_box_licenses.get(cb, set()))
+                if existing + pending_licenses.get(cb, 0) >= MAX_CLUES_PER_BOX:
+                    LOGGER.debug(
+                        "Skipping slot (%d,%d) dir=%s — clue box %s full after pending",
+                        sig.start_row, sig.start_col, sig.direction.value, cb,
+                    )
+                    continue
                 slot_clue_boxes[id(sig)] = cb
+                pending_licenses[cb] = pending_licenses.get(cb, 0) + 1
                 licensable.append(sig)
             except ClueBoxError:
                 LOGGER.debug(
@@ -991,7 +1137,20 @@ class CrosswordGenerator:
     # ------------------------------------------------------------------
     # Crossing validation (used during theme seeding)
     # ------------------------------------------------------------------
-    def _validate_crossings(self, grid: CrosswordGrid, slot: WordSlot) -> None:
+    def _validate_crossings(
+        self,
+        grid: CrosswordGrid,
+        slot: WordSlot,
+        min_candidates_override: Optional[int] = None,
+    ) -> None:
+        """Validate that all crossings created by *slot* have enough dictionary candidates.
+
+        Args:
+            min_candidates_override: When set, use this value as the minimum
+                candidate count for all crossing lengths (soft mode for user words).
+                When None, graduated thresholds apply: length 3-4 need >=3,
+                length 5 needs >=2, length 6+ needs >=1.
+        """
         for check_dir in (Direction.ACROSS, Direction.DOWN):
             for row, col in slot.cells:
                 signature = self._build_signature(grid, row, col, check_dir)
@@ -1014,20 +1173,24 @@ class CrosswordGenerator:
                     sanitized = self.dictionary.sanitize(surface)
                     if sanitized in self.theme_word_surfaces or self.dictionary.contains(surface):
                         continue
-                if signature.length == 3:
-                    count = self.dictionary.count_candidates(
-                        signature.length, pattern, banned=self.used_words,
-                    )
-                    if count < 3:
-                        raise SlotPlacementError(
-                            f"Too few candidates ({count}) for 3-letter crossing at "
-                            f"{(signature.start_row, signature.start_col)}"
-                        )
-                elif not self.dictionary.has_candidates(
+
+                # Determine minimum candidate threshold
+                if min_candidates_override is not None:
+                    min_required = min_candidates_override
+                elif signature.length <= 4:
+                    min_required = 3
+                elif signature.length == 5:
+                    min_required = 2
+                else:
+                    min_required = 1
+
+                count = self.dictionary.count_candidates(
                     signature.length, pattern, banned=self.used_words,
-                ):
+                )
+                if count < min_required:
                     raise SlotPlacementError(
-                        f"No viable candidates for crossing slot at "
+                        f"Too few candidates ({count}/{min_required}) for "
+                        f"{signature.length}-letter crossing at "
                         f"{(signature.start_row, signature.start_col)}"
                     )
 

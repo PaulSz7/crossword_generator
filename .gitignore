@@ -208,5 +208,7 @@ __marimo__/
 
 # Custom
 .DS_Store
-.claude
+# Claude Code — ignore everything except shared skill files
+.claude/*
+!.claude/skills/
 local_db

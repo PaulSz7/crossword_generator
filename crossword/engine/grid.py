@@ -72,6 +72,99 @@ class CrosswordGrid:
         if config.place_blocker_zone:
             self.place_blocker_zone()
 
+    @classmethod
+    def from_entries(
+        cls,
+        width: int,
+        height: int,
+        entries: list,
+        blocker_zone: list | None = None,
+    ) -> "CrosswordGrid":
+        """Reconstruct a filled grid from a compact entries array.
+
+        This is the inverse of ``CrosswordStore._build_entries`` — it rebuilds
+        the grid's cells, word_slots, clue_box_licenses, and counters from a
+        previously serialized document.
+
+        Args:
+            width: Grid column count.
+            height: Grid row count.
+            entries: List of entry dicts as produced by ``_build_entries``.
+            blocker_zone: Optional ``[row, col, h, w]`` blocker zone rect.
+
+        Returns:
+            A fully populated ``CrosswordGrid`` ready for clue attachment.
+        """
+        config = GridConfig(
+            height=height,
+            width=width,
+            place_blocker_zone=False,  # we'll place blocker cells manually
+        )
+        # Bypass __init__'s auto-placement by creating a bare instance
+        grid = object.__new__(cls)
+        grid.config = config
+        grid.bounds = config.bounds()
+        grid.rng = random.Random()
+        grid._blocker_rng = None
+        grid.cells = [
+            [Cell() for _ in range(grid.bounds.cols)] for _ in range(grid.bounds.rows)
+        ]
+        grid.word_slots = {}
+        grid.clue_box_licenses = {}
+        grid.blocker_zone = None
+        grid._playable_count = grid.bounds.rows * grid.bounds.cols
+        grid._filled_count = 0
+
+        # 1. Mark blocker zone cells
+        if blocker_zone:
+            bz_r, bz_c, bz_h, bz_w = blocker_zone
+            grid.blocker_zone = (bz_r, bz_c, bz_h, bz_w)
+            for r in range(bz_r, bz_r + bz_h):
+                for c in range(bz_c, bz_c + bz_w):
+                    cell = grid.cells[r][c]
+                    cell.type = CellType.BLOCKER_ZONE
+                    grid._playable_count -= 1
+
+        # 2. Collect all clue box positions from entries
+        cb_positions: Set[Tuple[int, int]] = set()
+        for entry in entries:
+            cb_positions.add(tuple(entry["cb"]))
+
+        for cb_r, cb_c in cb_positions:
+            cell = grid.cells[cb_r][cb_c]
+            if cell.type != CellType.BLOCKER_ZONE:
+                cell.type = CellType.CLUE_BOX
+                grid._playable_count -= 1
+            grid.clue_box_licenses[(cb_r, cb_c)] = set()
+
+        # 3. Walk each entry's cells, set letters and build WordSlots
+        for entry in entries:
+            direction = Direction.ACROSS if entry["dir"] == "A" else Direction.DOWN
+            slot = WordSlot(
+                id=entry["id"],
+                start_row=entry["r"],
+                start_col=entry["c"],
+                direction=direction,
+                length=entry["len"],
+                clue_box=tuple(entry["cb"]),
+                text=entry["answer"],
+                is_theme=entry.get("theme", False),
+                word_breaks=tuple(entry.get("word_breaks", ())),
+            )
+            grid.word_slots[slot.id] = slot
+            grid.clue_box_licenses.setdefault(slot.clue_box, set()).add(slot.id)
+
+            answer = entry["answer"] or ""
+            for i, (r, c) in enumerate(slot.cells):
+                cell = grid.cells[r][c]
+                if cell.type == CellType.EMPTY_PLAYABLE:
+                    grid._filled_count += 1
+                cell.type = CellType.LETTER
+                cell.letter = answer[i].upper() if i < len(answer) else None
+                cell.part_of_word_ids.add(slot.id)
+
+        return grid
+
     # ------------------------------------------------------------------
     # Initialization helpers
     # ------------------------------------------------------------------
@@ -107,18 +200,14 @@ class CrosswordGrid:
             start_col if start_col is not None else self.config.blocker_zone_col
         )
 
-        max_h = min(
-            self.config.max_blocker_size,
-            max(3, self.bounds.rows // 2),
-            self.bounds.rows,
-        )
-        max_w = min(
-            self.config.max_blocker_size,
-            max(3, self.bounds.cols // 2),
-            self.bounds.cols,
-        )
-        min_h = min(self.config.min_blocker_size, max_h) if max_h else 1
-        min_w = min(self.config.min_blocker_size, max_w) if max_w else 1
+        max_h = min(self.config.max_blocker_size, self.bounds.rows // 2 - 1)
+        max_w = min(self.config.max_blocker_size, self.bounds.cols // 2 - 1)
+        min_h = self.config.min_blocker_size
+        min_w = self.config.min_blocker_size
+
+        if max_h < min_h or max_w < min_w:
+            LOGGER.info("Grid too small to place blocker zone — skipping")
+            return
 
         def resolve_dimension(
             requested: Optional[int],

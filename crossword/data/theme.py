@@ -12,7 +12,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, Sequence, Set, Tuple
 
 from ..core.constants import Difficulty
-from ..io.gemini_client import GeminiClient
+from ..io.gemini_client import GeminiClient, GeminiUnavailableError
 from ..io.prompt_log import PromptLog
 from ..utils.logger import get_logger
 from .normalization import clean_word, extract_word_breaks
@@ -423,35 +423,35 @@ class GeminiThemeWordGenerator:
 
     def __init__(
         self,
-        model_name: str = "gemini-2.5-flash",
         api_key_env: str = "GEMINI_API_KEY",
-        model_env: str = "GEMINI_MODEL",
         theme_type: str = "domain_specific_words",
         theme_description: str = "",
         cache: Optional["ThemeCache"] = None,
         gemini_client: Optional[GeminiClient] = None,
         prompt_log: Optional[PromptLog] = None,
         allow_multi_word: bool = False,
+        allow_repair: bool = False,
     ) -> None:
-        """Initialize with optional pre-built client and cache."""
-        resolved_model = os.environ.get(model_env, model_name)
-        self.model_name = resolved_model
+        """Initialize with optional pre-built client and cache.
+
+        Args:
+            allow_repair: When True, send a repair LLM call for invalid entries.
+                When False (default), invalid entries are silently dropped.
+        """
         self.api_key_env = api_key_env
-        self.model_env = model_env
         self.theme_type = theme_type
         self.theme_description = theme_description
         self.cache = cache
         self._client = gemini_client
         self._prompt_log = prompt_log
         self.allow_multi_word = allow_multi_word
+        self.allow_repair = allow_repair
 
     def _get_client(self) -> GeminiClient:
         """Return the cached client or create a new one."""
         if self._client is None:
             self._client = GeminiClient(
-                model_name=self.model_name,
                 api_key_env=self.api_key_env,
-                model_env=self.model_env,
                 prompt_log=self._prompt_log,
             )
         return self._client
@@ -498,32 +498,39 @@ class GeminiThemeWordGenerator:
             len(valid), len(raw_words), len(needs_repair),
         )
         if needs_repair:
-            LOGGER.warning(
-                "Sending repair request for %d theme words: %s",
-                len(needs_repair),
-                ", ".join(e.get("word", "?") for e in needs_repair),
-            )
-            repair_prompt = _build_theme_repair_prompt(needs_repair, language, theme, difficulty)
-            repair_schema = self._build_response_schema(len(needs_repair))
-            repair_text = client.generate_text(
-                repair_prompt,
-                system_instruction=THEME_SYSTEM_INSTRUCTION,
-                response_schema=repair_schema,
-                request_type="theme_repair",
-            )
-            repaired = self._parse_response(repair_text, self.theme_type)
-            if repaired is not None:
-                repaired_words, _, _ = repaired
-                repaired_valid, still_invalid = _validate_theme_words(
-                    repaired_words, allow_multi_word=self.allow_multi_word,
+            if self.allow_repair:
+                LOGGER.warning(
+                    "Sending repair request for %d theme words: %s",
+                    len(needs_repair),
+                    ", ".join(e.get("word", "?") for e in needs_repair),
                 )
-                valid.extend(repaired_valid)
-                if still_invalid:
-                    LOGGER.warning(
-                        "After repair, %d theme words still invalid (dropping): %s",
-                        len(still_invalid),
-                        ", ".join(e.get("word", "?") for e in still_invalid),
+                repair_prompt = _build_theme_repair_prompt(needs_repair, language, theme, difficulty)
+                repair_schema = self._build_response_schema(len(needs_repair))
+                repair_text = client.generate_text(
+                    repair_prompt,
+                    system_instruction=THEME_SYSTEM_INSTRUCTION,
+                    response_schema=repair_schema,
+                    request_type="theme_repair",
+                )
+                repaired = self._parse_response(repair_text, self.theme_type)
+                if repaired is not None:
+                    repaired_words, _, _ = repaired
+                    repaired_valid, still_invalid = _validate_theme_words(
+                        repaired_words, allow_multi_word=self.allow_multi_word,
                     )
+                    valid.extend(repaired_valid)
+                    if still_invalid:
+                        LOGGER.warning(
+                            "After repair, %d theme words still invalid (dropping): %s",
+                            len(still_invalid),
+                            ", ".join(e.get("word", "?") for e in still_invalid),
+                        )
+            else:
+                LOGGER.warning(
+                    "Repair disabled — dropping %d invalid theme words: %s",
+                    len(needs_repair),
+                    ", ".join(e.get("word", "?") for e in needs_repair),
+                )
 
         # Build ThemeOutput
         entries = self._build_theme_words(valid)
@@ -951,6 +958,8 @@ def merge_theme_generators(
     if primary:
         try:
             extend(primary.generate(theme, limit=target, difficulty=difficulty, language=language))
+        except GeminiUnavailableError:
+            raise
         except Exception as exc:  # pragma: no cover - integration only
             LOGGER.warning("Primary theme generator failed: %s", exc)
 
@@ -959,6 +968,8 @@ def merge_theme_generators(
             break
         try:
             extend(generator.generate(theme, limit=target, difficulty=difficulty, language=language))
+        except GeminiUnavailableError:
+            raise
         except Exception as exc:
             LOGGER.warning("Fallback theme generator %s failed: %s", generator, exc)
 

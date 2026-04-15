@@ -21,6 +21,13 @@ class GeminiAPIError(RuntimeError):
     """Raised when the Gemini API responds with an error payload."""
 
 
+class GeminiUnavailableError(GeminiAPIError):
+    """Raised on transient API failures (503, 429) that should not be retried."""
+
+
+DEFAULT_GEMINI_MODEL_ENV = "GEMINI_MODEL"
+
+
 class GeminiClient:
     """Minimal client around the public Gemini REST API."""
 
@@ -28,13 +35,16 @@ class GeminiClient:
 
     def __init__(
         self,
-        model_name: str = "gemini-2.5-flash",
         api_key_env: str = "GEMINI_API_KEY",
-        model_env: str = "GEMINI_MODEL",
+        model_env: str = DEFAULT_GEMINI_MODEL_ENV,
         timeout_seconds: float = 120.0,
         prompt_log: Optional["PromptLog"] = None,
     ) -> None:
-        self.model_name = os.environ.get(model_env, model_name)
+        self.model_name = os.environ.get(model_env)
+        if not self.model_name:
+            raise RuntimeError(
+                f"Missing Gemini model in environment variable {model_env}"
+            )
         self.api_key_env = api_key_env
         self.model_env = model_env
         self.timeout_seconds = timeout_seconds
@@ -79,7 +89,13 @@ class GeminiClient:
                 json=payload,
                 timeout=self.timeout_seconds,
             )
+            if response.status_code in (429, 503):
+                raise GeminiUnavailableError(
+                    f"Gemini request failed: {response.status_code} {response.reason}"
+                )
             response.raise_for_status()
+        except GeminiUnavailableError:
+            raise
         except requests.RequestException as exc:  # pragma: no cover - network failure
             raise GeminiAPIError(f"Gemini request failed: {exc}") from exc
 
@@ -119,7 +135,13 @@ class GeminiClient:
                 json=payload,
                 timeout=self.timeout_seconds,
             )
+            if response.status_code in (429, 503):
+                raise GeminiUnavailableError(
+                    f"Gemini grounded request failed: {response.status_code} {response.reason}"
+                )
             response.raise_for_status()
+        except GeminiUnavailableError:
+            raise
         except requests.RequestException as exc:  # pragma: no cover - network failure
             raise GeminiAPIError(f"Gemini grounded request failed: {exc}") from exc
 
